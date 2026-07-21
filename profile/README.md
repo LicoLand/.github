@@ -1,60 +1,38 @@
 <p align="center">
-  <a href="https://licolite.com">
-    <img src="https://licolite.com/assets/banner.svg" alt="LicoLite - Traceable shared workspace for AI agents" width="100%">
+  <a href="https://licoland.com">
+    <img src="https://licomesh.com/assets/hero-mesh.svg" alt="LicoMesh — governed agent connectivity" width="100%">
   </a>
 </p>
 
-# LicoLite
+# LicoLand
 
-Traceable shared workspace for AI agents.
+Open-source, private-deployable infrastructure for governed agent collaboration.
 
-LicoLite is building a governed collaboration layer where agents can share files, knowledge, tools, and delegated work without losing provenance. Every meaningful operation should be attributable, auditable, and recoverable.
+LicoLand builds the LicoMesh ecosystem: a governed connectivity layer where
+agents, devices, and services share files, knowledge, tools, and delegated
+work without losing provenance. Every meaningful operation is attributable,
+auditable, and recoverable — on infrastructure you control.
 
-<p>
-  <a href="https://licolite.com"><strong>Website</strong></a>
-  |
-  <a href="https://github.com/LicoLite/licolite"><strong>Core repo</strong></a>
-  |
-  <a href="https://github.com/LicoLite/licolite-community/discussions"><strong>Community</strong></a>
-</p>
-
-## What we are building
-
-<table>
-  <tr>
-    <td width="33%">
-      <strong>Traceable workspace</strong><br>
-      File operations, checkpoints, and agent contributions with durable provenance.
-    </td>
-    <td width="33%">
-      <strong>Governed tools</strong><br>
-      MCP-native access to workspace, code, knowledge, tools, services, and agent relay channels.
-    </td>
-    <td width="33%">
-      <strong>Recoverable collaboration</strong><br>
-      Audit trails, proof receipts, rollback points, and evidence packs for multi-agent work.
-    </td>
-  </tr>
-</table>
-
-## Start here
+## Projects
 
 | Repository | Purpose |
 | --- | --- |
-| [`licolite`](https://github.com/LicoLite/licolite) | Core platform: server, web console, CLI client, desktop app, MCP connector, and proof substrate. |
-| [`licolite.com`](https://github.com/LicoLite/licolite.com) | Product website and public documentation entry point. |
-| [`licolite-community`](https://github.com/LicoLite/licolite-community) | Discussions, feedback, roadmap notes, and community coordination. |
-| [`licolite-skills`](https://github.com/LicoLite/licolite-skills) | Agent skills, integration recipes, and reusable workspace playbooks. |
+| [LicoMesh](https://github.com/LicoLand/LicoMesh) | Core agent gateway — governed downstream MCP access, upstream service forwarding, audit records, checkpoints, and proof substrate. Pre-release. |
+| [LicoArc](https://github.com/LicoLand/LicoArc) | Open-source client that brings local agents and devices into one clear workspace. |
+| [LicoMesh-Plugins](https://github.com/LicoLand/LicoMesh-Plugins) | Independent, default-disabled runtime plugins for LicoMesh. |
+| [LicoArc-Plugins](https://github.com/LicoLand/LicoArc-Plugins) | Codex plugin marketplace for Lico Arc client integrations. |
+| [Lico-Auditor](https://github.com/LicoLand/Lico-Auditor) | External privacy and release audit gate for governed LicoLand repositories. |
+| [licomesh.com](https://github.com/LicoLand/licomesh.com) | Official product website and documentation entry point. |
 
 ## Design principles
 
-- Provenance first: every shared artifact should carry enough context to understand who changed it, when, and why.
-- Governed by default: agents should collaborate through explicit channels and scoped grants.
-- Local-friendly: teams should be able to run LicoLite in their own infrastructure and keep control of their data.
-- Built for agent teams: humans, coding agents, research agents, and workflow agents should work in the same durable workspace.
+- **Provenance first** — every shared artifact carries enough context to know who changed it, when, and why.
+- **Governed by default** — agents collaborate through explicit interfaces, scoped permissions, and durable audit trails.
+- **Private-deployable** — run on your own infrastructure and keep control of your data.
+- **Recoverable state** — checkpoints, rollback points, and evidence packs for multi-agent work.
 
-## Follow along
-
-- Product site: [licolite.com](https://licolite.com)
-- Main project: [github.com/LicoLite/licolite](https://github.com/LicoLite/licolite)
-- Community discussions: [github.com/LicoLite/licolite-community/discussions](https://github.com/LicoLite/licolite-community/discussions)
+<p>
+  <a href="https://licoland.com"><strong>Website</strong></a> ·
+  <a href="https://github.com/LicoLand/LicoMesh"><strong>Core project</strong></a> ·
+  <a href="https://licomesh.com"><strong>Product site</strong></a>
+</p>
