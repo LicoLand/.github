@@ -1,0 +1,52 @@
+name: lico-auditor-gate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lico-auditor-gate:
+    name: lico-auditor-gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          path: target
+
+      - name: Checkout audit source of truth
+        uses: actions/checkout@v5
+        with:
+          repository: LicoLand/Lico-Auditor
+          ref: only
+          fetch-depth: 0
+          path: lico-auditor
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Verify audit source of truth
+        run: |
+          lico-auditor/bin/lico-auditor source-of-truth \
+            --repo lico-auditor \
+            --remote origin \
+            --branch only \
+            --require-current-head \
+            --enforce-remote-heads
+
+      - name: Run Lico-Auditor gate
+        run: |
+          lico-auditor/bin/lico-auditor gate \
+            --repo target \
+            --history \
+            --format text
