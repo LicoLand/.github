@@ -1,4 +1,4 @@
-name: lico-auditor-gate
+name: organization-audit-gate
 
 on:
   pull_request:
@@ -11,8 +11,8 @@ permissions:
   contents: read
 
 jobs:
-  lico-auditor-gate:
-    name: lico-auditor-gate
+  organization-audit-gate:
+    name: organization-audit-gate
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -44,9 +44,17 @@ jobs:
             --require-current-head \
             --enforce-remote-heads
 
-      - name: Run Lico-Auditor gate
+      - name: Run organization audit gate
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
+          scan_ref="$HEAD_SHA"
+          if git -C target cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            scan_ref="$BASE_SHA..$HEAD_SHA"
+          fi
           lico-auditor/bin/lico-auditor gate \
             --repo target \
             --history \
+            --ref "$scan_ref" \
             --format text
