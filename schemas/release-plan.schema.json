@@ -1,0 +1,419 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/LicoLand/.github/main/schemas/release-plan.schema.json",
+  "title": "LicoLand repository release plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schemaVersion",
+    "repository",
+    "profile",
+    "currentVersion",
+    "versionSources",
+    "changelog",
+    "nextRelease",
+    "releases",
+    "components"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "format": "uri"
+    },
+    "schemaVersion": {
+      "const": 1
+    },
+    "repository": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+    },
+    "profile": {
+      "enum": [
+        "governance",
+        "continuous-site",
+        "inactive",
+        "semver",
+        "component-semver"
+      ]
+    },
+    "currentVersion": {
+      "$ref": "#/$defs/nullableSemver"
+    },
+    "versionSources": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/versionSource"
+      }
+    },
+    "changelog": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "nextRelease": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/releasePlan"
+        }
+      ]
+    },
+    "releases": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/releaseRecord"
+      }
+    },
+    "components": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/component"
+      }
+    }
+  },
+  "$defs": {
+    "semver": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(?:\\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "stableSemver": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+    },
+    "httpsUri": {
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://(?![^/?#]*@)[^\\s/?#]+(?:[/?#][^\\s]*)?$"
+    },
+    "nullableSemver": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/semver"
+        }
+      ]
+    },
+    "versionSource": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "format",
+            "path",
+            "pointer"
+          ],
+          "properties": {
+            "format": {
+              "const": "json"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "pointer": {
+              "type": "string",
+              "pattern": "^(?:|/.*)$"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "format",
+            "path",
+            "key"
+          ],
+          "properties": {
+            "format": {
+              "const": "toml"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "format",
+            "path"
+          ],
+          "properties": {
+            "format": {
+              "const": "text"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "format",
+            "path",
+            "pattern"
+          ],
+          "properties": {
+            "format": {
+              "const": "regex"
+            },
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "pattern": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ]
+    },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "type",
+        "title",
+        "status",
+        "issue",
+        "risk",
+        "acceptance",
+        "evidence"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_-]{1,31}$"
+        },
+        "type": {
+          "enum": [
+            "capability",
+            "breaking",
+            "fix"
+          ]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "status": {
+          "enum": [
+            "planned",
+            "active",
+            "blocked",
+            "accepted"
+          ]
+        },
+        "issue": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/httpsUri"
+            }
+          ]
+        },
+        "risk": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        "acceptance": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "releaseCore": {
+      "type": "object",
+      "required": [
+        "version",
+        "classification",
+        "status",
+        "targetDate",
+        "milestone",
+        "releaseIssue",
+        "scenarios",
+        "blockers"
+      ],
+      "properties": {
+        "version": {
+          "$ref": "#/$defs/stableSemver"
+        },
+        "classification": {
+          "enum": [
+            "initial",
+            "stabilization",
+            "major",
+            "minor",
+            "patch"
+          ]
+        },
+        "status": {
+          "enum": [
+            "planned",
+            "active",
+            "blocked",
+            "ready"
+          ]
+        },
+        "targetDate": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "format": "date"
+            }
+          ]
+        },
+        "milestone": {
+          "type": "string",
+          "pattern": "^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+        },
+        "releaseIssue": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/httpsUri"
+            }
+          ]
+        },
+        "scenarios": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/scenario"
+          }
+        },
+        "blockers": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "releasePlan": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/releaseCore"
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "releaseRecord": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/releaseCore"
+        },
+        {
+          "type": "object",
+          "required": [
+            "releasedAt",
+            "releaseUrl"
+          ],
+          "properties": {
+            "releasedAt": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "releaseUrl": {
+              "$ref": "#/$defs/httpsUri"
+            }
+          }
+        }
+      ],
+      "unevaluatedProperties": false
+    },
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "currentVersion",
+        "versionSources",
+        "changelog",
+        "nextRelease",
+        "releases"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$"
+        },
+        "currentVersion": {
+          "$ref": "#/$defs/nullableSemver"
+        },
+        "versionSources": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/versionSource"
+          }
+        },
+        "changelog": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "nextRelease": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/releasePlan"
+            }
+          ]
+        },
+        "releases": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/releaseRecord"
+          }
+        }
+      }
+    }
+  }
+}

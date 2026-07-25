@@ -1,0 +1,53 @@
+name: version-governance-portfolio
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_run:
+    workflows:
+      - version-governance
+    types:
+      - completed
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  pull-request-portfolio:
+    if: ${{ github.event_name == 'pull_request_target' }}
+    uses: LicoLand/.github/.github/workflows/reusable-version-governance.yml@@GOVERNANCE_REF@
+    with:
+      governance-ref: "@GOVERNANCE_REF@"
+      target-repository: ${{ github.event.pull_request.head.repo.full_name }}
+      target-ref: ${{ github.event.pull_request.head.sha }}
+      expected-repository: ${{ github.repository }}
+      plan-path: docs/releases/plan.json
+      github-check: true
+      project-owner: LicoLand
+      project-title: LicoLand Release Portfolio
+
+  tag-portfolio:
+    if: >-
+      ${{
+        github.event_name == 'workflow_run' &&
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push'
+      }}
+    uses: LicoLand/.github/.github/workflows/reusable-version-governance.yml@@GOVERNANCE_REF@
+    with:
+      governance-ref: "@GOVERNANCE_REF@"
+      target-repository: ${{ github.repository }}
+      target-ref: ${{ github.event.workflow_run.head_sha }}
+      expected-repository: ${{ github.repository }}
+      plan-path: docs/releases/plan.json
+      tag: ${{ github.event.workflow_run.head_branch }}
+      require_tag: true
+      github-check: true
+      project-owner: LicoLand
+      project-title: LicoLand Release Portfolio
