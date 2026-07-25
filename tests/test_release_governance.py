@@ -21,6 +21,9 @@ WORKFLOW_TEMPLATE_ROOT = (
     / ".github"
     / "workflows"
 )
+NATIVE_WORKFLOW_TEMPLATE_ROOT = (
+    Path(__file__).resolve().parents[1] / "workflow-templates"
+)
 SPEC = importlib.util.spec_from_file_location("release_governance", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 rg = importlib.util.module_from_spec(SPEC)
@@ -1377,6 +1380,49 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("independent Lico-Auditor", issue)
         self.assertIn("Owning Lico-Dev skill or workflow", pull_request)
         self.assertIn("Lico-Auditor remains an independent final gate", pull_request)
+
+    def test_native_organization_template_combines_both_required_jobs(self) -> None:
+        workflow = (
+            NATIVE_WORKFLOW_TEMPLATE_ROOT
+            / "licoland-repository-release-governance.yml"
+        ).read_text(encoding="utf-8")
+        metadata = json.loads(
+            (
+                NATIVE_WORKFLOW_TEMPLATE_ROOT
+                / "licoland-repository-release-governance.properties.json"
+            ).read_text(encoding="utf-8")
+        )
+        governance_ref = "0875118889c39df343afeb6f4aa6e82f9690cc4d"
+        self.assertIn("  pull_request_target:", workflow)
+        self.assertNotIn("\n  pull_request:", workflow)
+        self.assertIn("      - $default-branch", workflow)
+        self.assertIn("  workflow_dispatch:", workflow)
+        self.assertIn("  version-governance:", workflow)
+        self.assertIn("  lico-auditor:", workflow)
+        self.assertIn(
+            "uses: LicoLand/.github/.github/workflows/"
+            f"reusable-version-governance.yml@{governance_ref}",
+            workflow,
+        )
+        self.assertIn(f'      governance_ref: "{governance_ref}"', workflow)
+        self.assertIn(
+            "uses: LicoLand/Lico-Auditor/.github/workflows/"
+            "release-audit.yml@only",
+            workflow,
+        )
+        self.assertIn("permissions:\n  contents: read", workflow)
+        self.assertNotIn("secrets:", workflow)
+        self.assertEqual(
+            metadata,
+            {
+                "name": "LicoLand Repository Release Governance",
+                "description": (
+                    "Validate an independent repository version contract and "
+                    "run the Lico-Auditor final gate."
+                ),
+                "categories": ["Automation"],
+            },
+        )
 
 
 class SchemaConsistencyTests(unittest.TestCase):

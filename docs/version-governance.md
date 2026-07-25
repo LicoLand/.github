@@ -19,6 +19,12 @@ field records the owning repository item's version and never creates an
 organization version. `governance`, `continuous-site`, and `inactive` profiles
 do not become product versions merely because they use the common template.
 
+For interactive adoption, GitHub exposes one native Actions starter named
+`LicoLand Repository Release Governance`. It combines the credential-free
+version-contract job and the independent Lico-Auditor job, and replaces
+`$default-branch` with the adopting repository's default branch. Automated
+rollout may use the equivalent files under `templates/repository/`.
+
 ## Governing model
 
 Every release fact has one owner:
@@ -232,6 +238,13 @@ Each repository carries:
   `pull_request_target` and default-branch `workflow_run` checks that can enter
   the protected `release-portfolio` environment. The latter repeats remote
   readiness verification after the credential-free tag check succeeds.
+
+The native organization starter lives at
+`workflow-templates/licoland-repository-release-governance.yml` with its
+matching `.properties.json` metadata file. It is the single GitHub UI entry for
+the version-contract and Auditor baseline. The Portfolio caller remains
+separate because it must not exist until its protected read-only credential is
+provisioned.
 
 Edit the plan, then regenerate and verify:
 

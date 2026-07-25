@@ -1,0 +1,35 @@
+name: repository-release-governance
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  push:
+    branches:
+      - $default-branch
+    tags:
+      - "v*.*.*"
+      - "*-v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version-governance:
+    uses: LicoLand/.github/.github/workflows/reusable-version-governance.yml@0875118889c39df343afeb6f4aa6e82f9690cc4d
+    with:
+      governance_ref: "0875118889c39df343afeb6f4aa6e82f9690cc4d"
+      target_repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+      target_ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      expected_repository: ${{ github.repository }}
+      plan_path: docs/releases/plan.json
+      tag: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+      require_tag: ${{ github.ref_type == 'tag' }}
+      github_check: false
+
+  lico-auditor:
+    uses: LicoLand/Lico-Auditor/.github/workflows/release-audit.yml@only
