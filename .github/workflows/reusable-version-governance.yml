@@ -3,23 +3,23 @@ name: reusable-version-governance
 on:
   workflow_call:
     inputs:
-      governance-ref:
+      governance_ref:
         description: Immutable commit containing the shared verifier.
         required: true
         type: string
-      target-repository:
+      target_repository:
         description: Repository whose pull request or tag is being evaluated.
         required: true
         type: string
-      target-ref:
+      target_ref:
         description: Immutable target commit to read as untrusted release data.
         required: true
         type: string
-      expected-repository:
+      expected_repository:
         description: Exact owner/name identity required in the release plan.
         required: true
         type: string
-      plan-path:
+      plan_path:
         description: Repository-relative structured release plan.
         required: false
         default: docs/releases/plan.json
@@ -34,21 +34,25 @@ on:
         required: false
         default: false
         type: boolean
-      github-check:
+      github_check:
         description: Verify closed GitHub issues, milestone, and private Project state.
         required: false
         default: false
         type: boolean
-      project-owner:
+      project_owner:
         description: Organization that owns the release portfolio.
         required: false
         default: LicoLand
         type: string
-      project-title:
+      project_title:
         description: Exact private Project title.
         required: false
         default: LicoLand Release Portfolio
         type: string
+    secrets:
+      RELEASE_PROJECT_TOKEN:
+        description: Protected environment credential for private Project verification.
+        required: false
 
 permissions:
   contents: read
@@ -56,15 +60,15 @@ permissions:
 jobs:
   local-contract:
     name: version-governance
-    if: ${{ !inputs.github-check }}
+    if: ${{ !inputs.github_check }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout release candidate as data
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ inputs.target-repository }}
-          ref: ${{ inputs.target-ref }}
+          repository: ${{ inputs.target_repository }}
+          ref: ${{ inputs.target_ref }}
           fetch-depth: 0
           persist-credentials: false
           path: target
@@ -73,7 +77,7 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           repository: LicoLand/.github
-          ref: ${{ inputs.governance-ref }}
+          ref: ${{ inputs.governance_ref }}
           persist-credentials: false
           path: governance
           sparse-checkout: |
@@ -87,8 +91,8 @@ jobs:
 
       - name: Verify repository version contract
         env:
-          EXPECTED_REPOSITORY: ${{ inputs.expected-repository }}
-          PLAN_PATH: ${{ inputs.plan-path }}
+          EXPECTED_REPOSITORY: ${{ inputs.expected_repository }}
+          PLAN_PATH: ${{ inputs.plan_path }}
           REQUIRE_TAG: ${{ inputs.require_tag }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
@@ -109,20 +113,16 @@ jobs:
 
   trusted-portfolio:
     name: version-governance-portfolio
-    if: ${{ inputs.github-check }}
+    if: ${{ inputs.github_check }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     environment: release-portfolio
-    permissions:
-      contents: read
-      issues: read
-      pull-requests: read
     steps:
       - name: Checkout release candidate as data
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
-          repository: ${{ inputs.target-repository }}
-          ref: ${{ inputs.target-ref }}
+          repository: ${{ inputs.target_repository }}
+          ref: ${{ inputs.target_ref }}
           fetch-depth: 0
           persist-credentials: false
           path: target
@@ -131,7 +131,7 @@ jobs:
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
         with:
           repository: LicoLand/.github
-          ref: ${{ inputs.governance-ref }}
+          ref: ${{ inputs.governance_ref }}
           persist-credentials: false
           path: governance
           sparse-checkout: |
@@ -145,11 +145,11 @@ jobs:
 
       - name: Verify trusted GitHub release state
         env:
-          EXPECTED_REPOSITORY: ${{ inputs.expected-repository }}
+          EXPECTED_REPOSITORY: ${{ inputs.expected_repository }}
           GH_TOKEN: ${{ secrets.RELEASE_PROJECT_TOKEN }}
-          PLAN_PATH: ${{ inputs.plan-path }}
-          PROJECT_OWNER: ${{ inputs.project-owner }}
-          PROJECT_TITLE: ${{ inputs.project-title }}
+          PLAN_PATH: ${{ inputs.plan_path }}
+          PROJECT_OWNER: ${{ inputs.project_owner }}
+          PROJECT_TITLE: ${{ inputs.project_title }}
           REQUIRE_TAG: ${{ inputs.require_tag }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
