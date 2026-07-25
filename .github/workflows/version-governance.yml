@@ -14,11 +14,11 @@ jobs:
   version-governance:
     uses: ./.github/workflows/reusable-version-governance.yml
     with:
-      governance-ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      target-repository: ${{ github.repository }}
-      target-ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      expected-repository: ${{ github.repository }}
-      plan-path: docs/releases/plan.json
+      governance_ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      target_repository: ${{ github.repository }}
+      target_ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      expected_repository: ${{ github.repository }}
+      plan_path: docs/releases/plan.json
       tag: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
       require_tag: ${{ github.ref_type == 'tag' }}
-      github-check: false
+      github_check: false
