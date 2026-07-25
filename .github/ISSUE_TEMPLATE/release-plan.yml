@@ -46,6 +46,8 @@ body:
       options:
         - label: Version transition and scenario mix pass the organization verifier.
         - label: Every scenario is accepted and has reviewed evidence.
+        - label: Lico-Dev implemented each scenario through its canonical owner workflow and the plan records sanitized receipts.
         - label: Repository-owned build, security, packaging, and acceptance checks pass.
+        - label: The independent Lico-Auditor candidate and full-history final gates pass.
         - label: All issues are represented in the organization Project and this milestone.
         - label: The version source and changelog name the target version.

@@ -4,6 +4,21 @@ This document is the organization-wide authority for planning and releasing
 versioned LicoLand projects. Product behavior, acceptance criteria, and release
 evidence remain owned by the repository that implements them.
 
+## Independent repository versions
+
+There is no organization-wide product version, synchronized release train, or
+shared release scope. Each product repository or independently versioned
+component owns its current version, next release, scenarios, milestone, tag,
+and GitHub Release. For example, one repository may publish `0.2.0` while
+another remains at `0.1.4`.
+
+The organization `.github` repository supplies only the common schema, issue
+and pull-request templates, verifier, and reusable workflow callers. The
+private organization Project is an aggregate portfolio: its `Target Version`
+field records the owning repository item's version and never creates an
+organization version. `governance`, `continuous-site`, and `inactive` profiles
+do not become product versions merely because they use the common template.
+
 ## Governing model
 
 Every release fact has one owner:
@@ -87,9 +102,36 @@ side state. A release moves through `planned` → `active` → `ready`, with
 - the repository milestone is closed with no open items;
 - the version source and changelog name the target version;
 - every release item is present in the organization Project; and
-- the repository's own build, security, packaging, and acceptance checks pass.
+- the repository's own build, security, packaging, and acceptance checks pass;
+  and
+- the independent Lico-Auditor final gate passes.
 
-The organization gate does not replace a product repository's release checks.
+The organization version-contract gate does not replace a product repository's
+release checks or the independent audit.
+
+## Agent implementation and independent audit
+
+Lico-Dev and Lico-Auditor have deliberately separate authorities:
+
+1. Lico-Dev's `$lico-release-engineering-workflow` reads the owning
+   `docs/releases/plan.json`, routes the scenario to its canonical repository
+   owner, implements one independently acceptable closure, and produces
+   sanitized acceptance receipts.
+2. The organization template standardizes the version contract and verifies
+   that the declared transition, scenarios, issues, milestone, evidence, and
+   release state agree.
+3. Lico-Auditor independently audits the candidate change and, for a stable tag
+   or explicit release-readiness dispatch, all reachable content history.
+
+Lico-Dev cannot approve its own final audit. The trusted repository caller
+passes no repository, ref, profile, or secret input to Lico-Auditor. The
+Auditor derives those facts from the GitHub event, verifies its canonical
+`only` source, treats the target checkout as data, and never executes target
+repository code.
+
+Implementation receipts, version-contract verification, repository acceptance,
+and the Auditor answer different questions. None can substitute for another,
+and no administrator bypass may turn a failed claim into a release.
 
 ## GitHub Project
 
@@ -161,6 +203,13 @@ Bootstrap enforcement in this order:
 3. Create the active ruleset with no bypass actors.
 4. Read the ruleset back and confirm its branch, context, and strict mode.
 
+Install `.github/workflows/lico-auditor-release-gate.yml` separately. After its
+default-branch candidate check succeeds, require the exact additional context
+`lico-auditor / final-gate` with no bypass actors. Do not activate that required
+context before the caller exists and has a successful run. Before a stable tag,
+an explicit dispatch of the same workflow must also pass its full-history
+phase.
+
 Do not require the trusted Portfolio context until the private Project and its
 protected environment credential are provisioned. Once available, the
 additional pull-request context is
@@ -176,7 +225,9 @@ Each repository carries:
 - `tools/release/verify-version-governance`, a thin wrapper pinned to an
   immutable organization-tool revision and digest; and
 - `.github/workflows/version-governance.yml`, the credential-free local and tag
-  gate pinned to the same reusable workflow revision; and
+  gate pinned to the same reusable workflow revision;
+- `.github/workflows/lico-auditor-release-gate.yml`, the input-free trusted
+  caller for Lico-Auditor candidate and full-history final gates; and
 - `.github/workflows/version-governance-portfolio.yml`, the trusted
   `pull_request_target` and default-branch `workflow_run` checks that can enter
   the protected `release-portfolio` environment. The latter repeats remote
@@ -213,18 +264,26 @@ The first command is read-only. `--apply` is required for every GitHub write.
 ## Release lifecycle
 
 1. Add the target version and scenarios to the owning repository plan.
-2. Render the repository documentation and run the local verifier.
+2. Invoke Lico-Dev's `$lico-release-engineering-workflow`; bind the declared
+   release contract, render the repository documentation, and run the local
+   verifier before implementation.
 3. Run `sync-github` to create or update labels, the milestone, the release
    issue, scenario issues, and Project items.
-4. Implement each scenario through a pull request that closes its issue.
-5. Record reviewed evidence in the plan and mark accepted scenarios.
+4. Implement one independently acceptable scenario at a time through the
+   canonical Lico-Dev owner workflow and a pull request that closes its issue.
+5. Record reviewed, sanitized Lico-Dev receipts in the plan and mark accepted
+   scenarios.
 6. In the release pull request, set the release to `ready`, update the version
-   source and changelog, and pass both the credential-free contract gate and
-   the trusted portfolio gate.
-7. Close the release issue and milestone, then create the matching tag.
-8. Treat the pushed tag as a release candidate until both its credential-free
-   check and the subsequent default-branch portfolio check succeed.
-9. Publish the GitHub Release only after both tag checks succeed.
+   source and changelog, and pass repository acceptance, the credential-free
+   contract gate, the Lico-Auditor candidate gate, and the trusted portfolio
+   gate when provisioned.
+7. Explicitly dispatch `lico-auditor-release-gate.yml` and require its
+   full-history phase to pass. Then close the release issue and milestone and
+   create the matching tag.
+8. Treat the pushed tag as a release candidate until its credential-free
+   contract check, Lico-Auditor full-history gate, and subsequent default-branch
+   portfolio check succeed.
+9. Publish the GitHub Release only after every applicable tag check succeeds.
 10. Finalize the plan so the released contract enters immutable repository
    history and the next release returns to an unplanned state.
 
