@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/LicoLand/.github/main/schemas/release-plan.schema.json",
+  "schemaVersion": 1,
+  "repository": "LicoLand/.github",
+  "profile": "governance",
+  "currentVersion": null,
+  "versionSources": [],
+  "changelog": null,
+  "nextRelease": null,
+  "releases": [],
+  "components": []
+}

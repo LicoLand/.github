@@ -1,0 +1,43 @@
+name: version-governance-tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version-governance-tests:
+    name: version-governance-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout organization governance
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.13"
+
+      - name: Run version governance tests
+        run: python3 -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Compile verifier
+        run: python3 -m py_compile tools/release_governance.py tests/test_release_governance.py
+
+      - name: Verify organization release profile
+        run: |
+          python3 tools/release_governance.py verify \
+            --repository-root . \
+            --plan docs/releases/plan.json \
+            --expected-repository LicoLand/.github
+
+      - name: Validate static artifacts
+        run: |
+          python3 -m json.tool schemas/release-plan.schema.json >/dev/null
+          bash -n templates/repository/tools/release/verify-version-governance

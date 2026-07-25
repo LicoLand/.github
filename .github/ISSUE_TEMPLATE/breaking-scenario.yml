@@ -1,0 +1,75 @@
+name: Version breaking scenario
+description: Plan one breaking outcome and its migration acceptance for a major release.
+title: "[Breaking] "
+labels:
+  - "type:scenario"
+  - "type:breaking"
+  - "semver:major"
+  - "scenario:planned"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A breaking scenario must state the affected contract and a complete migration outcome.
+        Do not include credentials, private endpoints, runtime data, local paths, or unredacted evidence.
+  - type: input
+    id: target-version
+    attributes:
+      label: Target major version
+      placeholder: "1.0.0"
+    validations:
+      required: true
+  - type: input
+    id: scenario-id
+    attributes:
+      label: Scenario ID
+      placeholder: "BRK-001"
+    validations:
+      required: true
+  - type: textarea
+    id: affected-contract
+    attributes:
+      label: Affected contract
+      description: Identify the observable behavior or interface that will no longer remain compatible.
+    validations:
+      required: true
+  - type: textarea
+    id: migration-outcome
+    attributes:
+      label: Migration outcome
+      description: State the complete replacement state; do not preserve a retired compatibility path.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: List observable checks for both the new behavior and completed migration.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Planned evidence
+      description: Name the checks or public artifacts that will prove acceptance.
+    validations:
+      required: true
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Risk
+      options:
+        - low
+        - medium
+        - high
+    validations:
+      required: true
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Major-release confirmation
+      options:
+        - label: The scenario is bound to the next sequential major milestone.
+          required: true
+        - label: Superseded behavior and compatibility paths will be removed in the same migration.
+          required: true

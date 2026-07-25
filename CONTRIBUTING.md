@@ -32,3 +32,12 @@ dumps, user content, ciphertext, account metadata, or unredacted audit output.
 Source availability, local verification, packaging, GitHub Release, and
 third-party distribution channels are separate claims. Do not describe one as
 proof of another.
+
+## Plan versions through accepted scenarios
+
+Repository releases follow the organization
+[version governance policy](https://github.com/LicoLand/.github/blob/main/docs/version-governance.md).
+A minor version must deliver at least one independently accepted capability
+scenario. A patch version contains fixes only. Record the target version and
+acceptance contract in the owning repository before creating its milestone or
+implementation pull requests.

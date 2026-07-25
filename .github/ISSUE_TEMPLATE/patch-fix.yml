@@ -1,0 +1,74 @@
+name: Version patch fix
+description: Plan a backward-compatible bug fix for the next sequential patch release.
+title: "[Fix] "
+labels:
+  - "type:scenario"
+  - "type:fix"
+  - "semver:patch"
+  - "scenario:planned"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Patch releases fix incorrect behavior. A new capability requires a minor or major scenario.
+        Do not include credentials, private endpoints, runtime data, local paths, or unredacted evidence.
+  - type: input
+    id: target-version
+    attributes:
+      label: Target patch version
+      placeholder: "0.1.1"
+    validations:
+      required: true
+  - type: input
+    id: scenario-id
+    attributes:
+      label: Fix ID
+      placeholder: "FIX-001"
+    validations:
+      required: true
+  - type: textarea
+    id: incorrect-behavior
+    attributes:
+      label: Incorrect behavior
+      description: Describe the observable defect without private runtime content.
+    validations:
+      required: true
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Use a synthetic, redacted example.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Regression acceptance
+      description: Identify the check that fails before the fix and passes after it.
+    validations:
+      required: true
+  - type: dropdown
+    id: risk
+    attributes:
+      label: Risk
+      options:
+        - low
+        - medium
+        - high
+    validations:
+      required: true
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Patch confirmation
+      options:
+        - label: This change does not add a new public capability or breaking behavior.
+          required: true
+        - label: This issue will be bound to the next sequential patch milestone.
+          required: true
