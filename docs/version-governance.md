@@ -111,16 +111,21 @@ Repository and milestone remain GitHub system fields. Project items must be
 real issues, not draft items. The shared tool adds or updates the release issue
 and all scenario issues idempotently.
 
-Project automation uses a credential with organization Projects read/write
-permission and repository Issues read/write permission; a narrowly scoped
-GitHub App installation token is preferred. The credential is exposed only as
-the protected `release-portfolio` environment secret
-`RELEASE_PROJECT_TOKEN`. Restrict that environment to the exact trusted base
-branch.
-Ordinary `pull_request` and tag jobs never receive it; the
+Interactive project bootstrap and synchronization use an operator credential
+with organization Projects read/write permission and repository Issues
+read/write permission. Never store this write-capable credential in Actions.
+
+The protected `release-portfolio` environment secret
+`RELEASE_PROJECT_TOKEN` is a separate verifier credential with only
+organization Projects read permission and repository Issues read permission.
+A short-lived GitHub App installation token is preferred; a narrowly scoped
+fine-grained token is acceptable when token minting happens outside the
+workflow. Restrict that environment to the exact trusted base branch.
+
+Ordinary `pull_request` and tag jobs never receive the verifier credential; the
 `pull_request_target` portfolio job reads the proposed checkout strictly as
-data and executes only the immutable organization verifier. Do not put a
-personal access token, App key, installation identifier, or private project
+data and executes only the immutable organization verifier. Do not put either
+credential, an App private key, an installation identifier, or private project
 metadata in source.
 
 Create or audit that fail-closed environment before provisioning its secret:
