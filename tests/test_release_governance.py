@@ -13,6 +13,14 @@ from unittest import mock
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "tools" / "release_governance.py"
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "schemas" / "release-plan.schema.json"
+WORKFLOW_ROOT = Path(__file__).resolve().parents[1] / ".github" / "workflows"
+WORKFLOW_TEMPLATE_ROOT = (
+    Path(__file__).resolve().parents[1]
+    / "templates"
+    / "repository"
+    / ".github"
+    / "workflows"
+)
 SPEC = importlib.util.spec_from_file_location("release_governance", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 rg = importlib.util.module_from_spec(SPEC)
@@ -1281,6 +1289,53 @@ class FinalizeTests(unittest.TestCase):
             (self.root / rg.DOCUMENT_PATH).read_text(encoding="utf-8"),
             rg.render_release_document(finalized),
         )
+
+
+class WorkflowContractTests(unittest.TestCase):
+    INPUT_NAMES = (
+        "governance_ref",
+        "target_repository",
+        "target_ref",
+        "expected_repository",
+        "plan_path",
+        "github_check",
+        "project_owner",
+        "project_title",
+    )
+    RETIRED_INPUT_NAMES = tuple(name.replace("_", "-") for name in INPUT_NAMES)
+
+    def test_reusable_workflow_uses_expression_safe_input_names(self) -> None:
+        reusable = (
+            WORKFLOW_ROOT / "reusable-version-governance.yml"
+        ).read_text(encoding="utf-8")
+        for name in self.INPUT_NAMES:
+            with self.subTest(name=name):
+                self.assertIn(f"      {name}:", reusable)
+        for name in self.RETIRED_INPUT_NAMES:
+            with self.subTest(retired=name):
+                self.assertNotIn(f"      {name}:", reusable)
+                self.assertNotIn(f"inputs.{name}", reusable)
+
+    def test_callers_use_only_canonical_input_names(self) -> None:
+        callers = (
+            WORKFLOW_ROOT / "version-governance.yml",
+            WORKFLOW_TEMPLATE_ROOT / "version-governance.yml",
+            WORKFLOW_TEMPLATE_ROOT / "version-governance-portfolio.yml",
+        )
+        for caller in callers:
+            text = caller.read_text(encoding="utf-8")
+            for name in self.RETIRED_INPUT_NAMES:
+                with self.subTest(caller=caller.name, retired=name):
+                    self.assertNotIn(f"      {name}:", text)
+
+    def test_reusable_workflow_cannot_elevate_caller_token(self) -> None:
+        reusable = (
+            WORKFLOW_ROOT / "reusable-version-governance.yml"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("      issues: read", reusable)
+        self.assertNotIn("      pull-requests: read", reusable)
+        self.assertIn("      RELEASE_PROJECT_TOKEN:", reusable)
+        self.assertIn("          GH_TOKEN: ${{ secrets.RELEASE_PROJECT_TOKEN }}", reusable)
 
 
 class SchemaConsistencyTests(unittest.TestCase):

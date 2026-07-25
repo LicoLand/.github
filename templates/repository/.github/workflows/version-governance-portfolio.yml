@@ -23,14 +23,14 @@ jobs:
     if: ${{ github.event_name == 'pull_request_target' }}
     uses: LicoLand/.github/.github/workflows/reusable-version-governance.yml@@GOVERNANCE_REF@
     with:
-      governance-ref: "@GOVERNANCE_REF@"
-      target-repository: ${{ github.event.pull_request.head.repo.full_name }}
-      target-ref: ${{ github.event.pull_request.head.sha }}
-      expected-repository: ${{ github.repository }}
-      plan-path: docs/releases/plan.json
-      github-check: true
-      project-owner: LicoLand
-      project-title: LicoLand Release Portfolio
+      governance_ref: "@GOVERNANCE_REF@"
+      target_repository: ${{ github.event.pull_request.head.repo.full_name }}
+      target_ref: ${{ github.event.pull_request.head.sha }}
+      expected_repository: ${{ github.repository }}
+      plan_path: docs/releases/plan.json
+      github_check: true
+      project_owner: LicoLand
+      project_title: LicoLand Release Portfolio
 
   tag-portfolio:
     if: >-
@@ -41,13 +41,13 @@ jobs:
       }}
     uses: LicoLand/.github/.github/workflows/reusable-version-governance.yml@@GOVERNANCE_REF@
     with:
-      governance-ref: "@GOVERNANCE_REF@"
-      target-repository: ${{ github.repository }}
-      target-ref: ${{ github.event.workflow_run.head_sha }}
-      expected-repository: ${{ github.repository }}
-      plan-path: docs/releases/plan.json
+      governance_ref: "@GOVERNANCE_REF@"
+      target_repository: ${{ github.repository }}
+      target_ref: ${{ github.event.workflow_run.head_sha }}
+      expected_repository: ${{ github.repository }}
+      plan_path: docs/releases/plan.json
       tag: ${{ github.event.workflow_run.head_branch }}
       require_tag: true
-      github-check: true
-      project-owner: LicoLand
-      project-title: LicoLand Release Portfolio
+      github_check: true
+      project_owner: LicoLand
+      project_title: LicoLand Release Portfolio
