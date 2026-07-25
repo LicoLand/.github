@@ -1337,6 +1337,47 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("      RELEASE_PROJECT_TOKEN:", reusable)
         self.assertIn("          GH_TOKEN: ${{ secrets.RELEASE_PROJECT_TOKEN }}", reusable)
 
+    def test_auditor_template_is_input_free_and_uses_trusted_events(self) -> None:
+        caller = (
+            WORKFLOW_TEMPLATE_ROOT / "lico-auditor-release-gate.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("  pull_request_target:", caller)
+        self.assertNotIn("\n  pull_request:", caller)
+        self.assertIn('      - "@DEFAULT_BRANCH@"', caller)
+        self.assertIn('      - "v*.*.*"', caller)
+        self.assertIn('      - "*-v*.*.*"', caller)
+        self.assertIn("  workflow_dispatch:", caller)
+        self.assertIn(
+            "uses: LicoLand/Lico-Auditor/.github/workflows/"
+            "release-audit.yml@only",
+            caller,
+        )
+        self.assertIn("permissions:\n  contents: read", caller)
+        self.assertNotIn("\n    with:", caller)
+        self.assertNotIn("secrets:", caller)
+
+    def test_templates_preserve_agent_and_auditor_separation(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        governance = (root / "docs" / "version-governance.md").read_text(
+            encoding="utf-8"
+        )
+        issue = (
+            root / ".github" / "ISSUE_TEMPLATE" / "release-plan.yml"
+        ).read_text(encoding="utf-8")
+        pull_request = (
+            root / ".github" / "PULL_REQUEST_TEMPLATE.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("There is no organization-wide product version", governance)
+        self.assertIn("Each product repository", governance)
+        self.assertIn("$lico-release-engineering-workflow", governance)
+        self.assertIn("Lico-Dev cannot approve its own final audit", governance)
+        self.assertIn("never executes target", governance)
+        self.assertIn("lico-auditor / final-gate", governance)
+        self.assertIn("Lico-Dev implemented each scenario", issue)
+        self.assertIn("independent Lico-Auditor", issue)
+        self.assertIn("Owning Lico-Dev skill or workflow", pull_request)
+        self.assertIn("Lico-Auditor remains an independent final gate", pull_request)
+
 
 class SchemaConsistencyTests(unittest.TestCase):
     @classmethod
