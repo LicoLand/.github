@@ -139,6 +139,29 @@ python3 tools/release_governance.py bootstrap-environment \
 The first command is read-only. The tool accepts exactly one branch policy and
 never reads, creates, lists, or changes environment secrets.
 
+## Branch enforcement
+
+Every first-party repository must have an active repository ruleset named
+`LicoLand version governance`. It targets only the repository's default branch
+and strictly requires the exact check context
+`version-governance / version-governance`. Keep this rule separate from
+repository-specific audit, review, linear-history, and deletion rules so adding
+version governance never rewrites or weakens an existing protection.
+
+Bootstrap enforcement in this order:
+
+1. Merge the pinned repository caller workflow.
+2. Dispatch `version-governance.yml` once on the default branch and confirm the
+   exact required check succeeds.
+3. Create the active ruleset with no bypass actors.
+4. Read the ruleset back and confirm its branch, context, and strict mode.
+
+Do not require the trusted Portfolio context until the private Project and its
+protected environment credential are provisioned. Once available, the
+additional pull-request context is
+`pull-request-portfolio / version-governance-portfolio`. A release must never
+use an administrator bypass to evade either required context.
+
 ## Repository files
 
 Each repository carries:
