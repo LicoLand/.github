@@ -1,0 +1,51 @@
+name: Version release plan
+description: Track one repository release after its structured plan has been reviewed.
+title: "[Release] "
+labels:
+  - "type:release"
+  - "release:planned"
+body:
+  - type: input
+    id: target-version
+    attributes:
+      label: Target version
+      placeholder: "0.2.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: classification
+    attributes:
+      label: Classification
+      options:
+        - patch
+        - minor
+        - major
+        - initial
+        - stabilization
+    validations:
+      required: true
+  - type: input
+    id: plan
+    attributes:
+      label: Owning plan
+      description: Repository-relative path to the reviewed structured plan.
+      value: "docs/releases/plan.json"
+    validations:
+      required: true
+  - type: textarea
+    id: scenarios
+    attributes:
+      label: Scenario issues
+      description: Link every issue represented in the plan.
+    validations:
+      required: true
+  - type: checkboxes
+    id: readiness
+    attributes:
+      label: Readiness
+      options:
+        - label: Version transition and scenario mix pass the organization verifier.
+        - label: Every scenario is accepted and has reviewed evidence.
+        - label: Repository-owned build, security, packaging, and acceptance checks pass.
+        - label: All issues are represented in the organization Project and this milestone.
+        - label: The version source and changelog name the target version.

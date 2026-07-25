@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+governance_ref="@GOVERNANCE_REF@"
+expected_digest="@TOOL_SHA256@"
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+repo_root="$(cd -- "$script_dir/../.." && pwd -P)"
+
+python_bin=""
+if command -v python3 >/dev/null 2>&1; then
+  python_bin="python3"
+elif command -v python >/dev/null 2>&1; then
+  python_bin="python"
+else
+  echo "version-governance: Python 3 is required" >&2
+  exit 2
+fi
+
+digest_file() {
+  "$python_bin" -c \
+    'import hashlib, pathlib, sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())' \
+    "$1"
+}
+
+tool_path="${LICOLAND_RELEASE_GOVERNANCE_TOOL:-}"
+if [[ -n "$tool_path" ]]; then
+  if [[ ! -f "$tool_path" ]] || [[ "$(digest_file "$tool_path")" != "$expected_digest" ]]; then
+    echo "version-governance: configured shared tool failed integrity verification" >&2
+    exit 2
+  fi
+fi
+
+if [[ -z "$tool_path" ]]; then
+  sibling_tool="$repo_root/../.github/tools/release_governance.py"
+  if [[ -f "$sibling_tool" ]] && [[ "$(digest_file "$sibling_tool")" == "$expected_digest" ]]; then
+    tool_path="$sibling_tool"
+  fi
+fi
+
+temporary_root=""
+cleanup() {
+  if [[ -n "$temporary_root" ]] && [[ -d "$temporary_root" ]]; then
+    rm -rf -- "$temporary_root"
+  fi
+}
+trap cleanup EXIT
+
+if [[ -z "$tool_path" ]]; then
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "version-governance: curl is required when the pinned shared tool is not available locally" >&2
+    exit 2
+  fi
+  temporary_root="$(mktemp -d "${TMPDIR:-/tmp}/lico-release-governance.XXXXXX")"
+  tool_path="$temporary_root/release_governance.py"
+  curl --proto '=https' --tlsv1.2 -fsSL \
+    "https://raw.githubusercontent.com/LicoLand/.github/$governance_ref/tools/release_governance.py" \
+    -o "$tool_path"
+  if [[ "$(digest_file "$tool_path")" != "$expected_digest" ]]; then
+    echo "version-governance: downloaded shared tool failed integrity verification" >&2
+    exit 2
+  fi
+fi
+
+command_name="${1:-verify}"
+if [[ "$#" -gt 0 ]]; then
+  shift
+fi
+
+"$python_bin" "$tool_path" "$command_name" \
+  --repository-root "$repo_root" \
+  --plan "docs/releases/plan.json" \
+  "$@"

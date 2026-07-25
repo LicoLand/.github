@@ -1,0 +1,172 @@
+name: reusable-version-governance
+
+on:
+  workflow_call:
+    inputs:
+      governance-ref:
+        description: Immutable commit containing the shared verifier.
+        required: true
+        type: string
+      target-repository:
+        description: Repository whose pull request or tag is being evaluated.
+        required: true
+        type: string
+      target-ref:
+        description: Immutable target commit to read as untrusted release data.
+        required: true
+        type: string
+      expected-repository:
+        description: Exact owner/name identity required in the release plan.
+        required: true
+        type: string
+      plan-path:
+        description: Repository-relative structured release plan.
+        required: false
+        default: docs/releases/plan.json
+        type: string
+      tag:
+        description: Tag being evaluated, or an empty string outside tag events.
+        required: false
+        default: ""
+        type: string
+      require_tag:
+        description: Fail closed unless a non-empty tag identity is supplied.
+        required: false
+        default: false
+        type: boolean
+      github-check:
+        description: Verify closed GitHub issues, milestone, and private Project state.
+        required: false
+        default: false
+        type: boolean
+      project-owner:
+        description: Organization that owns the release portfolio.
+        required: false
+        default: LicoLand
+        type: string
+      project-title:
+        description: Exact private Project title.
+        required: false
+        default: LicoLand Release Portfolio
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  local-contract:
+    name: version-governance
+    if: ${{ !inputs.github-check }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout release candidate as data
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          repository: ${{ inputs.target-repository }}
+          ref: ${{ inputs.target-ref }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: target
+
+      - name: Checkout pinned organization governance
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          repository: LicoLand/.github
+          ref: ${{ inputs.governance-ref }}
+          persist-credentials: false
+          path: governance
+          sparse-checkout: |
+            tools/release_governance.py
+            schemas/release-plan.schema.json
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.13"
+
+      - name: Verify repository version contract
+        env:
+          EXPECTED_REPOSITORY: ${{ inputs.expected-repository }}
+          PLAN_PATH: ${{ inputs.plan-path }}
+          REQUIRE_TAG: ${{ inputs.require_tag }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ "$REQUIRE_TAG" == "true" && -z "$RELEASE_TAG" ]]; then
+            echo "version-governance: required tag identity is unavailable" >&2
+            exit 2
+          fi
+          args=(
+            verify
+            --repository-root target
+            --plan "$PLAN_PATH"
+            --expected-repository "$EXPECTED_REPOSITORY"
+          )
+          if [[ -n "$RELEASE_TAG" ]]; then
+            args+=(--tag "$RELEASE_TAG")
+          fi
+          python3 governance/tools/release_governance.py "${args[@]}"
+
+  trusted-portfolio:
+    name: version-governance-portfolio
+    if: ${{ inputs.github-check }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: release-portfolio
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - name: Checkout release candidate as data
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          repository: ${{ inputs.target-repository }}
+          ref: ${{ inputs.target-ref }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: target
+
+      - name: Checkout pinned organization governance
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+        with:
+          repository: LicoLand/.github
+          ref: ${{ inputs.governance-ref }}
+          persist-credentials: false
+          path: governance
+          sparse-checkout: |
+            tools/release_governance.py
+            schemas/release-plan.schema.json
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.13"
+
+      - name: Verify trusted GitHub release state
+        env:
+          EXPECTED_REPOSITORY: ${{ inputs.expected-repository }}
+          GH_TOKEN: ${{ secrets.RELEASE_PROJECT_TOKEN }}
+          PLAN_PATH: ${{ inputs.plan-path }}
+          PROJECT_OWNER: ${{ inputs.project-owner }}
+          PROJECT_TITLE: ${{ inputs.project-title }}
+          REQUIRE_TAG: ${{ inputs.require_tag }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          if [[ "$REQUIRE_TAG" == "true" && -z "$RELEASE_TAG" ]]; then
+            echo "version-governance: required tag identity is unavailable" >&2
+            exit 2
+          fi
+          args=(
+            verify
+            --repository-root target
+            --plan "$PLAN_PATH"
+            --expected-repository "$EXPECTED_REPOSITORY"
+            --github
+            --project-owner "$PROJECT_OWNER"
+            --project-title "$PROJECT_TITLE"
+          )
+          if [[ -n "$RELEASE_TAG" ]]; then
+            args+=(--tag "$RELEASE_TAG")
+          fi
+          python3 governance/tools/release_governance.py "${args[@]}"
