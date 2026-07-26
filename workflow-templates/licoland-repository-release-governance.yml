@@ -21,9 +21,9 @@ permissions:
 
 jobs:
   version-governance:
-    uses: LicoLand/.github/.github/workflows/reusable-version-governance.yml@0875118889c39df343afeb6f4aa6e82f9690cc4d
+    uses: LicoLand/.github/.github/workflows/reusable-version-governance.yml@1a2530f3614f3b4ca46b9bd89f020a1946d34e84
     with:
-      governance_ref: "0875118889c39df343afeb6f4aa6e82f9690cc4d"
+      governance_ref: "1a2530f3614f3b4ca46b9bd89f020a1946d34e84"
       target_repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
       target_ref: ${{ github.event.pull_request.head.sha || github.sha }}
       expected_repository: ${{ github.repository }}
