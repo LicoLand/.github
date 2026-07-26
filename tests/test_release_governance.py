@@ -611,22 +611,19 @@ class RemoteReadinessTests(unittest.TestCase):
             "github-issue-milestone", {finding.code for finding in report.errors}
         )
 
-    def test_remote_private_project_is_required(self) -> None:
-        for public_value in (True, None):
-            with self.subTest(public=public_value):
-                client = FakeVerifyGh(
-                    self.document,
-                    project_public=public_value,
-                )
-                report = self.verify_with(client)
-                self.assertIn(
-                    "github-project-privacy",
-                    {finding.code for finding in report.errors},
-                )
-
-    def test_remote_ready_contract_passes_with_closed_bound_items(self) -> None:
-        report = self.verify_with(FakeVerifyGh(self.document))
+    def test_remote_ready_contract_passes_with_closed_issues_and_milestone(self) -> None:
+        client = FakeVerifyGh(self.document)
+        report = self.verify_with(client)
         self.assertTrue(report.ok, report.errors)
+        self.assertTrue(
+            any("/issues/" in " ".join(arguments) for arguments in client.read_calls)
+        )
+        self.assertTrue(
+            any(
+                "milestones?state=all" in " ".join(arguments)
+                for arguments in client.read_calls
+            )
+        )
 
 
 class ComponentTagTests(unittest.TestCase):
@@ -1038,136 +1035,6 @@ class DryRunGitHubTests(unittest.TestCase):
         )
 
 
-class EnvironmentBootstrapTests(unittest.TestCase):
-    def test_missing_environment_dry_run_plans_only_strict_objects(self) -> None:
-        client = EnvironmentFake(apply=False, environments=[])
-        operations = rg.bootstrap_environment(
-            "LicoLand/example",
-            "main",
-            apply=False,
-            gh=client,
-        )
-        self.assertEqual(
-            operations,
-            ["environment.create", "environment.branch-policy.create"],
-        )
-        self.assertEqual(client.executed_mutations, 0)
-        serialized_arguments = " ".join(
-            argument
-            for call in client.mutation_arguments
-            for argument in call
-        ).lower()
-        self.assertNotIn("secret", serialized_arguments)
-
-    def test_existing_exact_policy_is_idempotent(self) -> None:
-        client = EnvironmentFake.strict(apply=False, branch="main")
-        operations = rg.bootstrap_environment(
-            "LicoLand/example",
-            "main",
-            apply=False,
-            gh=client,
-        )
-        self.assertEqual(operations, [])
-        self.assertEqual(client.executed_mutations, 0)
-
-    def test_unknown_or_loose_environment_policy_fails_without_writes(self) -> None:
-        policies = (
-            None,
-            {"protected_branches": True, "custom_branch_policies": False},
-            {"protected_branches": False},
-        )
-        for policy in policies:
-            with self.subTest(policy=policy):
-                client = EnvironmentFake(
-                    apply=True,
-                    environments=[
-                        {
-                            "name": rg.RELEASE_ENVIRONMENT,
-                            "deployment_branch_policy": policy,
-                        }
-                    ],
-                )
-                with self.assertRaises(rg.GovernanceError) as context:
-                    rg.bootstrap_environment(
-                        "LicoLand/example",
-                        "main",
-                        apply=True,
-                        gh=client,
-                    )
-                self.assertEqual(
-                    context.exception.code, "github-environment-policy"
-                )
-                self.assertEqual(client.executed_mutations, 0)
-
-    def test_wrong_or_multiple_branch_policy_fails_without_deletion(self) -> None:
-        invalid_sets = (
-            [{"id": 1, "name": "release/*", "type": "branch"}],
-            [{"id": 1, "name": "main", "type": "tag"}],
-            [
-                {"id": 1, "name": "main", "type": "branch"},
-                {"id": 2, "name": "develop", "type": "branch"},
-            ],
-        )
-        for policies in invalid_sets:
-            with self.subTest(policies=policies):
-                client = EnvironmentFake.strict(
-                    apply=True,
-                    branch="main",
-                    policies=policies,
-                )
-                with self.assertRaises(rg.GovernanceError) as context:
-                    rg.bootstrap_environment(
-                        "LicoLand/example",
-                        "main",
-                        apply=True,
-                        gh=client,
-                    )
-                self.assertEqual(
-                    context.exception.code, "github-environment-branch"
-                )
-                self.assertEqual(client.operations, [])
-                self.assertEqual(client.executed_mutations, 0)
-
-    def test_strict_environment_with_no_policy_creates_exact_branch_only(self) -> None:
-        client = EnvironmentFake.strict(
-            apply=True,
-            branch="main",
-            policies=[],
-        )
-        operations = rg.bootstrap_environment(
-            "LicoLand/example",
-            "main",
-            apply=True,
-            gh=client,
-        )
-        self.assertEqual(operations, ["environment.branch-policy.create"])
-        self.assertEqual(client.executed_mutations, 1)
-        arguments = client.mutation_arguments[0]
-        self.assertIn("name=main", arguments)
-        self.assertIn("type=branch", arguments)
-
-    def test_environment_rejects_unsafe_branch_and_apply_mismatch(self) -> None:
-        client = EnvironmentFake(apply=False, environments=[])
-        with self.assertRaises(rg.GovernanceError) as branch_error:
-            rg.bootstrap_environment(
-                "LicoLand/example",
-                "release/*",
-                apply=False,
-                gh=client,
-            )
-        self.assertEqual(branch_error.exception.code, "branch-invalid")
-        self.assertEqual(client.read_calls, [])
-        with self.assertRaises(rg.GovernanceError) as mode_error:
-            rg.bootstrap_environment(
-                "LicoLand/example",
-                "main",
-                apply=True,
-                gh=client,
-            )
-        self.assertEqual(mode_error.exception.code, "github-apply-mismatch")
-        self.assertEqual(client.read_calls, [])
-
-
 class FinalizeTests(unittest.TestCase):
     RELEASE_URL = "https://github.com/LicoLand/example/releases/tag/v0.2.0"
     RELEASED_AT = "2026-08-02T09:30:00Z"
@@ -1301,11 +1168,12 @@ class WorkflowContractTests(unittest.TestCase):
         "target_ref",
         "expected_repository",
         "plan_path",
-        "github_check",
-        "project_owner",
-        "project_title",
+        "tag",
+        "require_tag",
     )
-    RETIRED_INPUT_NAMES = tuple(name.replace("_", "-") for name in INPUT_NAMES)
+    RETIRED_INPUT_NAMES = tuple(
+        name.replace("_", "-") for name in INPUT_NAMES if "_" in name
+    )
 
     def test_reusable_workflow_uses_expression_safe_input_names(self) -> None:
         reusable = (
@@ -1323,7 +1191,6 @@ class WorkflowContractTests(unittest.TestCase):
         callers = (
             WORKFLOW_ROOT / "version-governance.yml",
             WORKFLOW_TEMPLATE_ROOT / "version-governance.yml",
-            WORKFLOW_TEMPLATE_ROOT / "version-governance-portfolio.yml",
         )
         for caller in callers:
             text = caller.read_text(encoding="utf-8")
@@ -1331,14 +1198,15 @@ class WorkflowContractTests(unittest.TestCase):
                 with self.subTest(caller=caller.name, retired=name):
                     self.assertNotIn(f"      {name}:", text)
 
-    def test_reusable_workflow_cannot_elevate_caller_token(self) -> None:
+    def test_reusable_workflow_uses_minimal_repository_token_permissions(self) -> None:
         reusable = (
             WORKFLOW_ROOT / "reusable-version-governance.yml"
         ).read_text(encoding="utf-8")
-        self.assertNotIn("      issues: read", reusable)
+        self.assertIn("  contents: read", reusable)
+        self.assertIn("  issues: read", reusable)
         self.assertNotIn("      pull-requests: read", reusable)
-        self.assertIn("      RELEASE_PROJECT_TOKEN:", reusable)
-        self.assertIn("          GH_TOKEN: ${{ secrets.RELEASE_PROJECT_TOKEN }}", reusable)
+        self.assertIn("          GH_TOKEN: ${{ github.token }}", reusable)
+        self.assertIn("            --github", reusable)
 
     def test_auditor_template_is_input_free_and_uses_trusted_events(self) -> None:
         caller = (
@@ -1411,6 +1279,7 @@ class WorkflowContractTests(unittest.TestCase):
             workflow,
         )
         self.assertIn("permissions:\n  contents: read", workflow)
+        self.assertIn("  issues: read", workflow)
         self.assertNotIn("secrets:", workflow)
         self.assertEqual(
             metadata,
@@ -1636,85 +1505,16 @@ class FakeGh:
         return {}
 
 
-class EnvironmentFake:
-    def __init__(
-        self,
-        *,
-        apply: bool,
-        environments: list[dict],
-        policies: list[dict] | None = None,
-    ):
-        self.apply = apply
-        self.environments = environments
-        self.policies = [] if policies is None else policies
-        self.operations: list[str] = []
-        self.read_calls: list[list[str]] = []
-        self.mutation_arguments: list[list[str]] = []
-        self.executed_mutations = 0
-
-    @classmethod
-    def strict(
-        cls,
-        *,
-        apply: bool,
-        branch: str,
-        policies: list[dict] | None = None,
-    ):
-        selected_policies = (
-            [{"id": 1, "name": branch, "type": "branch"}]
-            if policies is None
-            else policies
-        )
-        return cls(
-            apply=apply,
-            environments=[
-                {
-                    "name": rg.RELEASE_ENVIRONMENT,
-                    "deployment_branch_policy": {
-                        "protected_branches": False,
-                        "custom_branch_policies": True,
-                    },
-                }
-            ],
-            policies=selected_policies,
-        )
-
-    def json(self, arguments):
-        self.read_calls.append(list(arguments))
-        joined = " ".join(arguments)
-        if "deployment-branch-policies" in joined:
-            return {
-                "total_count": len(self.policies),
-                "branch_policies": self.policies,
-            }
-        if "/environments?per_page=" in joined:
-            return {
-                "total_count": len(self.environments),
-                "environments": self.environments,
-            }
-        raise AssertionError(f"unexpected environment read: {arguments[:2]}")
-
-    def mutate_json(self, operation, arguments):
-        self.operations.append(operation)
-        self.mutation_arguments.append(list(arguments))
-        if not self.apply:
-            return None
-        self.executed_mutations += 1
-        return {}
-
-
 class FakeVerifyGh:
     def __init__(
         self,
         document: dict,
         *,
         issue_milestone: str | None = None,
-        project_public: bool | None = False,
     ):
         self.apply = False
         self.document = document
         self.issue_milestone = issue_milestone
-        self.project_public = project_public
         self.read_calls: list[list[str]] = []
         self.operations: list[str] = []
 
@@ -1731,41 +1531,11 @@ class FakeVerifyGh:
             else []
         )
 
-    def _issue_urls(self) -> set[str]:
-        urls: set[str] = set()
-        for target in self._ready_releases():
-            if target["releaseIssue"]:
-                urls.add(target["releaseIssue"])
-            urls.update(
-                item["issue"]
-                for item in target["scenarios"]
-                if item["issue"] is not None
-            )
-        return urls
-
     def json(self, arguments):
         self.read_calls.append(list(arguments))
         joined = " ".join(arguments)
         if arguments[:2] == ["api", "graphql"]:
             return {}
-        if arguments[:2] == ["project", "list"]:
-            return {
-                "projects": [
-                    {
-                        "id": "PVT_project",
-                        "number": 7,
-                        "title": rg.DEFAULT_PROJECT_TITLE,
-                        "public": self.project_public,
-                    }
-                ]
-            }
-        if arguments[:2] == ["project", "item-list"]:
-            return {
-                "items": [
-                    {"id": f"ITEM_{index}", "content": {"url": url}}
-                    for index, url in enumerate(sorted(self._issue_urls()))
-                ]
-            }
         if "milestones?state=all" in joined:
             return [
                 {

@@ -17,6 +17,7 @@ on:
 
 permissions:
   contents: read
+  issues: read
 
 jobs:
   version-governance:
@@ -29,7 +30,6 @@ jobs:
       plan_path: docs/releases/plan.json
       tag: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
       require_tag: ${{ github.ref_type == 'tag' }}
-      github_check: false
 
   lico-auditor:
     uses: LicoLand/Lico-Auditor/.github/workflows/release-audit.yml@only

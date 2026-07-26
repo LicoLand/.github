@@ -20,7 +20,7 @@ organization version. `governance`, `continuous-site`, and `inactive` profiles
 do not become product versions merely because they use the common template.
 
 For interactive adoption, GitHub exposes one native Actions starter named
-`LicoLand Repository Release Governance`. It combines the credential-free
+`LicoLand Repository Release Governance`. It combines the read-only
 version-contract job and the independent Lico-Auditor job, and replaces
 `$default-branch` with the adopting repository's default branch. Automated
 rollout may use the equivalent files under `templates/repository/`.
@@ -107,7 +107,6 @@ side state. A release moves through `planned` → `active` → `ready`, with
 - every scenario issue and the release issue are closed;
 - the repository milestone is closed with no open items;
 - the version source and changelog name the target version;
-- every release item is present in the organization Project; and
 - the repository's own build, security, packaging, and acceptance checks pass;
   and
 - the independent Lico-Auditor final gate passes.
@@ -163,34 +162,11 @@ Interactive project bootstrap and synchronization use an operator credential
 with organization Projects read/write permission and repository Issues
 read/write permission. Never store this write-capable credential in Actions.
 
-The protected `release-portfolio` environment secret
-`RELEASE_PROJECT_TOKEN` is a separate verifier credential with only
-organization Projects read permission and repository Issues read permission.
-A short-lived GitHub App installation token is preferred; a narrowly scoped
-fine-grained token is acceptable when token minting happens outside the
-workflow. Restrict that environment to the exact trusted base branch.
-
-Ordinary `pull_request` and tag jobs never receive the verifier credential; the
-`pull_request_target` portfolio job reads the proposed checkout strictly as
-data and executes only the immutable organization verifier. Do not put either
-credential, an App private key, an installation identifier, or private project
-metadata in source.
-
-Create or audit that fail-closed environment before provisioning its secret:
-
-```bash
-python3 tools/release_governance.py bootstrap-environment \
-  --repository LicoLand/<repo> \
-  --branch <default-branch>
-
-python3 tools/release_governance.py bootstrap-environment \
-  --repository LicoLand/<repo> \
-  --branch <default-branch> \
-  --apply
-```
-
-The first command is read-only. The tool accepts exactly one branch policy and
-never reads, creates, lists, or changes environment secrets.
+The Project is an operator-managed aggregate projection, not release
+authority. `sync-github` maintains its items and fields, while
+`verify --github` deliberately verifies only the owning repository's issues,
+milestone, and tag. Project availability or projection lag therefore never
+changes the outcome of the required version-governance check.
 
 ## Branch enforcement
 
@@ -204,8 +180,9 @@ version governance never rewrites or weakens an existing protection.
 Bootstrap enforcement in this order:
 
 1. Merge the pinned repository caller workflow.
-2. Dispatch `version-governance.yml` once on the default branch and confirm the
-   exact required check succeeds.
+2. Grant the workflow only `contents: read` and `issues: read`, dispatch
+   `version-governance.yml` once on the default branch, and confirm the exact
+   required check succeeds.
 3. Create the active ruleset with no bypass actors.
 4. Read the ruleset back and confirm its branch, context, and strict mode.
 
@@ -216,12 +193,6 @@ context before the caller exists and has a successful run. Before a stable tag,
 an explicit dispatch of the same workflow must also pass its full-history
 phase.
 
-Do not require the trusted Portfolio context until the private Project and its
-protected environment credential are provisioned. Once available, the
-additional pull-request context is
-`pull-request-portfolio / version-governance-portfolio`. A release must never
-use an administrator bypass to evade either required context.
-
 ## Repository files
 
 Each repository carries:
@@ -230,21 +201,17 @@ Each repository carries:
 - `docs/releases/README.md`, generated from that plan;
 - `tools/release/verify-version-governance`, a thin wrapper pinned to an
   immutable organization-tool revision and digest; and
-- `.github/workflows/version-governance.yml`, the credential-free local and tag
-  gate pinned to the same reusable workflow revision;
+- `.github/workflows/version-governance.yml`, the read-only local and GitHub
+  release-state gate pinned to the same reusable workflow revision; and
 - `.github/workflows/lico-auditor-release-gate.yml`, the input-free trusted
-  caller for Lico-Auditor candidate and full-history final gates; and
-- `.github/workflows/version-governance-portfolio.yml`, the trusted
-  `pull_request_target` and default-branch `workflow_run` checks that can enter
-  the protected `release-portfolio` environment. The latter repeats remote
-  readiness verification after the credential-free tag check succeeds.
+  caller for Lico-Auditor candidate and full-history final gates.
 
 The native organization starter lives at
 `workflow-templates/licoland-repository-release-governance.yml` with its
 matching `.properties.json` metadata file. It is the single GitHub UI entry for
-the version-contract and Auditor baseline. The Portfolio caller remains
-separate because it must not exist until its protected read-only credential is
-provisioned.
+the version-contract and Auditor baseline. The reusable version-governance
+workflow uses the repository-provided `github.token`; no separately provisioned
+secret or environment is required.
 
 Edit the plan, then regenerate and verify:
 
@@ -287,15 +254,13 @@ The first command is read-only. `--apply` is required for every GitHub write.
 5. Record reviewed, sanitized Lico-Dev receipts in the plan and mark accepted
    scenarios.
 6. In the release pull request, set the release to `ready`, update the version
-   source and changelog, and pass repository acceptance, the credential-free
-   contract gate, the Lico-Auditor candidate gate, and the trusted portfolio
-   gate when provisioned.
+   source and changelog, and pass repository acceptance, the version-governance
+   contract and GitHub-state gate, and the Lico-Auditor candidate gate.
 7. Explicitly dispatch `lico-auditor-release-gate.yml` and require its
    full-history phase to pass. Then close the release issue and milestone and
    create the matching tag.
-8. Treat the pushed tag as a release candidate until its credential-free
-   contract check, Lico-Auditor full-history gate, and subsequent default-branch
-   portfolio check succeed.
+8. Treat the pushed tag as a release candidate until its version-governance
+   Issue/Milestone/Tag check and Lico-Auditor full-history gate succeed.
 9. Publish the GitHub Release only after every applicable tag check succeeds.
 10. Finalize the plan so the released contract enters immutable repository
    history and the next release returns to an unplanned state.
