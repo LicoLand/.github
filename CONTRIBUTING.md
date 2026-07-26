@@ -33,11 +33,12 @@ Source availability, local verification, packaging, GitHub Release, and
 third-party distribution channels are separate claims. Do not describe one as
 proof of another.
 
-## Plan versions through accepted scenarios
+## Plan versions through accepted features
 
 Repository releases follow the organization
 [version governance policy](https://github.com/LicoLand/.github/blob/main/docs/version-governance.md).
-A minor version must deliver at least one independently accepted capability
-scenario. A patch version contains fixes only. Record the target version and
-acceptance contract in the owning repository before creating its milestone or
-implementation pull requests.
+A minor version must deliver at least one independently accepted capability.
+A patch version contains fixes only. Record the target version, stable feature
+ID, dependencies, acceptance contract, and integration branch in the owning
+repository plan, then open one Draft pull request to that branch. Issues are optional
+for defects or discussion; releases and dependencies do not require them.

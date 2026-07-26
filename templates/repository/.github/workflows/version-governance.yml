@@ -10,14 +10,14 @@ on:
 
 permissions:
   contents: read
-  issues: read
+  pull-requests: read
 
 jobs:
   version-governance:
     uses: LicoLand/.github/.github/workflows/reusable-version-governance.yml@@GOVERNANCE_REF@
     with:
       governance_ref: "@GOVERNANCE_REF@"
-      target_repository: ${{ github.repository }}
+      target_repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
       target_ref: ${{ github.event.pull_request.head.sha || github.sha }}
       expected_repository: ${{ github.repository }}
       plan_path: docs/releases/plan.json

@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""LicoLand organization release-governance verifier and GitHub synchronizer.
+"""Verify repository-owned release plans and project them into GitHub Projects.
 
-The repository JSON plan is the release authority.  This module intentionally
-uses only the Python standard library and invokes ``gh`` with argument vectors
-(``shell=False``).  Command failures are reduced to safe error categories; raw
-GitHub output, credentials, and absolute machine paths are never reported.
+``docs/releases/plan.json`` is the release authority. Draft pull requests carry
+implementation, while the organization Project is a disposable projection.
+Issues and milestones are deliberately outside this contract.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import dataclasses
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -37,8 +38,8 @@ PROFILES = {
 }
 CLASSIFICATIONS = {"initial", "stabilization", "major", "minor", "patch"}
 RELEASE_STATUSES = {"planned", "active", "blocked", "ready"}
-SCENARIO_TYPES = {"capability", "breaking", "fix"}
-SCENARIO_STATUSES = {"planned", "active", "blocked", "accepted"}
+FEATURE_TYPES = {"capability", "breaking", "fix"}
+FEATURE_STATUSES = {"planned", "active", "blocked", "accepted"}
 RISK_LEVELS = {"low", "medium", "high"}
 SEMVER_RE = re.compile(
     r"^(0|[1-9][0-9]*)\."
@@ -48,12 +49,15 @@ SEMVER_RE = re.compile(
     r"(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$"
 )
 REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
-SCENARIO_ID_RE = re.compile(r"^[A-Z][A-Z0-9_-]{1,31}$")
-COMPONENT_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-STABLE_MILESTONE_RE = re.compile(
-    r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$"
+FEATURE_ID_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+FEATURE_REF_RE = re.compile(
+    r"^(?P<repository>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+):"
+    r"(?P<feature>[a-z0-9]+(?:-[a-z0-9]+)*)$"
 )
+COMPONENT_ID_RE = FEATURE_ID_RE
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
+MAX_DEPENDENCY_REPOSITORIES = 64
+MAX_DEPENDENCY_FEATURES = 4096
 
 
 class GovernanceError(Exception):
@@ -80,18 +84,18 @@ class VerificationReport:
 
     @property
     def errors(self) -> list[Finding]:
-        return [finding for finding in self.findings if finding.severity == "error"]
+        return [item for item in self.findings if item.severity == "error"]
 
     @property
     def warnings(self) -> list[Finding]:
-        return [finding for finding in self.findings if finding.severity == "warning"]
+        return [item for item in self.findings if item.severity == "warning"]
 
     @property
     def ok(self) -> bool:
         return not self.errors
 
     def error(self, code: str, message: str, path: str | None = None) -> None:
-        self.findings.append(Finding(code, message, path, "error"))
+        self.findings.append(Finding(code, message, path))
 
     def warning(self, code: str, message: str, path: str | None = None) -> None:
         self.findings.append(Finding(code, message, path, "warning"))
@@ -100,7 +104,7 @@ class VerificationReport:
         self.findings.extend(other.findings)
 
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass(frozen=True, order=True)
 class SemVer:
     major: int
     minor: int
@@ -108,18 +112,22 @@ class SemVer:
     prerelease: tuple[str, ...] = ()
     build: tuple[str, ...] = ()
 
+    @property
+    def stable(self) -> bool:
+        return not self.prerelease
+
     @classmethod
-    def parse(cls, value: str) -> "SemVer":
+    def parse(cls, value: Any) -> "SemVer":
         if not isinstance(value, str):
-            raise ValueError("version must be a string")
+            raise TypeError("version must be text")
         match = SEMVER_RE.fullmatch(value)
         if match is None:
-            raise ValueError("version is not valid SemVer")
+            raise ValueError("invalid SemVer")
         prerelease = tuple(match.group(4).split(".")) if match.group(4) else ()
-        build = tuple(match.group(5).split(".")) if match.group(5) else ()
-        for identifier in prerelease:
-            if identifier.isdigit() and len(identifier) > 1 and identifier.startswith("0"):
+        for item in prerelease:
+            if item.isdigit() and len(item) > 1 and item.startswith("0"):
                 raise ValueError("numeric prerelease identifiers cannot have leading zeroes")
+        build = tuple(match.group(5).split(".")) if match.group(5) else ()
         return cls(
             int(match.group(1)),
             int(match.group(2)),
@@ -128,239 +136,195 @@ class SemVer:
             build,
         )
 
-    @property
-    def core(self) -> tuple[int, int, int]:
-        return self.major, self.minor, self.patch
-
-    @property
-    def stable(self) -> bool:
-        return not self.prerelease
-
-    def core_text(self) -> str:
-        return f"{self.major}.{self.minor}.{self.patch}"
-
-    def __str__(self) -> str:
-        value = self.core_text()
-        if self.prerelease:
-            value += "-" + ".".join(self.prerelease)
-        if self.build:
-            value += "+" + ".".join(self.build)
-        return value
-
 
 def classify_transition(current: str | None, target: str) -> str:
-    """Classify a strict stable release transition.
-
-    Plans always target a stable version.  A prerelease may only stabilize to
-    its exact core.  LicoLand also treats the sequential public-stability move
-    from any ``0.y.z`` release to ``1.0.0`` as ``stabilization``.
-    """
-
-    target_version = SemVer.parse(target)
-    if not target_version.stable or target_version.build:
-        raise ValueError("the planned release version must be a stable SemVer")
+    candidate = SemVer.parse(target)
+    if not candidate.stable or candidate.build:
+        raise ValueError("target must be a stable SemVer")
     if current is None:
-        if target_version.core != (0, 1, 0):
-            raise ValueError("an initial release must be exactly 0.1.0")
-        return "initial"
-
-    current_version = SemVer.parse(current)
-    if current_version.prerelease:
-        if current_version.core != target_version.core:
-            raise ValueError(
-                "a prerelease can only stabilize to the same version core"
-            )
+        if candidate == SemVer(0, 1, 0):
+            return "initial"
+        raise ValueError("an initial release must be 0.1.0")
+    baseline = SemVer.parse(current)
+    if baseline.prerelease:
+        if (
+            baseline.major,
+            baseline.minor,
+            baseline.patch,
+        ) == (candidate.major, candidate.minor, candidate.patch):
+            return "stabilization"
+        raise ValueError("a prerelease can only stabilize to its exact core")
+    if baseline.build:
+        baseline = dataclasses.replace(baseline, build=())
+    if baseline.major == 0 and candidate == SemVer(1, 0, 0):
         return "stabilization"
-
-    if current_version.core == target_version.core:
-        raise ValueError("the target version does not advance the current version")
-
-    if current_version.major == 0 and target_version.core == (1, 0, 0):
-        return "stabilization"
-
-    if (
-        target_version.major == current_version.major
-        and target_version.minor == current_version.minor
-        and target_version.patch == current_version.patch + 1
-    ):
+    if candidate == SemVer(baseline.major, baseline.minor, baseline.patch + 1):
         return "patch"
-    if (
-        target_version.major == current_version.major
-        and target_version.minor == current_version.minor + 1
-        and target_version.patch == 0
-    ):
+    if candidate == SemVer(baseline.major, baseline.minor + 1, 0):
         return "minor"
-    if (
-        target_version.major == current_version.major + 1
-        and target_version.minor == 0
-        and target_version.patch == 0
-    ):
+    if candidate == SemVer(baseline.major + 1, 0, 0):
         return "major"
-    raise ValueError(
-        "stable releases must advance exactly one patch, minor, or major step"
-    )
+    raise ValueError("release transition must be sequential")
 
 
 def _display_path(root: Path, path: Path | str) -> str:
     candidate = Path(path)
     try:
         return candidate.resolve().relative_to(root.resolve()).as_posix()
-    except (OSError, ValueError):
-        return candidate.name or "."
+    except ValueError:
+        return "<outside-repository>"
 
 
 def _safe_path(root: Path, value: str | Path) -> Path:
-    if not isinstance(value, (str, Path)) or not str(value):
-        raise GovernanceError("invalid-path", "path must be a non-empty string")
-    candidate = Path(value)
-    if not candidate.is_absolute():
-        candidate = root / candidate
+    relative = Path(value)
+    if relative.is_absolute():
+        raise GovernanceError("unsafe-path", "repository path must be relative")
+    candidate = (root / relative).resolve()
     try:
-        resolved_root = root.resolve(strict=True)
-        resolved = candidate.resolve(strict=False)
-        resolved.relative_to(resolved_root)
-    except (OSError, ValueError) as exc:
-        raise GovernanceError(
-            "unsafe-path", "path must remain inside the repository", Path(value).name
-        ) from exc
-    return resolved
+        candidate.relative_to(root.resolve())
+    except ValueError as exc:
+        raise GovernanceError("unsafe-path", "repository path escapes repository") from exc
+    return candidate
 
 
 def _read_text(root: Path, value: str | Path) -> str:
     path = _safe_path(root, value)
-    display = _display_path(root, path)
     try:
         size = path.stat().st_size
-        if size > MAX_SOURCE_BYTES:
-            raise GovernanceError(
-                "source-too-large", "source exceeds the verification size limit", display
-            )
+    except OSError as exc:
+        raise GovernanceError(
+            "source-missing", "required repository source is unavailable", _display_path(root, path)
+        ) from exc
+    if size > MAX_SOURCE_BYTES:
+        raise GovernanceError(
+            "source-size", "repository source exceeds the verification limit", _display_path(root, path)
+        )
+    try:
         return path.read_text(encoding="utf-8")
-    except GovernanceError:
-        raise
-    except FileNotFoundError as exc:
-        raise GovernanceError("missing-file", "required file is missing", display) from exc
     except (OSError, UnicodeError) as exc:
-        raise GovernanceError("unreadable-file", "required file cannot be read", display) from exc
+        raise GovernanceError(
+            "source-read", "repository source could not be read as UTF-8", _display_path(root, path)
+        ) from exc
 
 
 def _json_pointer(document: Any, pointer: str) -> Any:
     if pointer == "":
         return document
-    if not isinstance(pointer, str) or not pointer.startswith("/"):
-        raise ValueError("JSON pointer must be empty or start with '/'")
+    if not pointer.startswith("/"):
+        raise ValueError("invalid JSON pointer")
     current = document
-    for raw_part in pointer[1:].split("/"):
-        part = raw_part.replace("~1", "/").replace("~0", "~")
+    for raw in pointer[1:].split("/"):
+        token = raw.replace("~1", "/").replace("~0", "~")
         if isinstance(current, list):
-            if not part.isdigit():
-                raise ValueError("JSON pointer list segment must be numeric")
-            index = int(part)
-            if index >= len(current):
-                raise ValueError("JSON pointer does not exist")
-            current = current[index]
+            current = current[int(token)]
         elif isinstance(current, Mapping):
-            if part not in current:
-                raise ValueError("JSON pointer does not exist")
-            current = current[part]
+            current = current[token]
         else:
-            raise ValueError("JSON pointer traverses a scalar value")
+            raise KeyError(token)
     return current
 
 
 def _toml_key(document: Any, key: str) -> Any:
-    if not key:
-        raise ValueError("TOML key is required")
     current = document
     for part in key.split("."):
-        if not isinstance(current, Mapping) or part not in current:
-            raise ValueError("TOML key does not exist")
+        if not isinstance(current, Mapping):
+            raise KeyError(part)
         current = current[part]
     return current
 
 
 def read_version_source(repository_root: Path | str, source: Mapping[str, Any]) -> str:
-    """Read one configured version source without exposing its raw contents."""
-
     root = Path(repository_root)
+    text = _read_text(root, str(source.get("path", "")))
     source_format = source.get("format")
-    relative_path = source.get("path")
-    if not isinstance(relative_path, str):
-        raise GovernanceError("invalid-source", "version source path is invalid")
-    text = _read_text(root, relative_path)
-    display = _display_path(root, _safe_path(root, relative_path))
     try:
         if source_format == "json":
-            document = json.loads(text)
-            value = _json_pointer(document, source.get("pointer", ""))
+            value = _json_pointer(json.loads(text), str(source["pointer"]))
         elif source_format == "toml":
-            document = tomllib.loads(text)
-            value = _toml_key(document, source.get("key", ""))
+            value = _toml_key(tomllib.loads(text), str(source["key"]))
         elif source_format == "text":
             value = text.strip()
         elif source_format == "regex":
-            pattern = source.get("pattern")
-            if not isinstance(pattern, str) or not pattern:
-                raise ValueError("regex pattern is required")
-            match = re.search(pattern, text, re.MULTILINE)
+            match = re.search(str(source["pattern"]), text)
             if match is None:
-                raise ValueError("regex pattern did not match")
-            if "version" in match.groupdict():
-                value = match.group("version")
-            elif match.lastindex:
-                value = match.group(1)
-            else:
-                value = match.group(0)
+                raise ValueError("pattern did not match")
+            value = match.group(1) if match.lastindex else match.group(0)
         else:
-            raise ValueError("unsupported version-source format")
-    except (json.JSONDecodeError, tomllib.TOMLDecodeError, TypeError, ValueError, re.error) as exc:
+            raise ValueError("unsupported source format")
+    except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError, tomllib.TOMLDecodeError) as exc:
         raise GovernanceError(
-            "invalid-version-source",
-            "version source cannot be resolved using its declared format",
-            display,
+            "version-source", "version source could not be evaluated", str(source.get("path", ""))
         ) from exc
-    if not isinstance(value, (str, int)):
+    if not isinstance(value, str) or not value.strip():
         raise GovernanceError(
-            "invalid-version-source",
-            "resolved version value must be a string or integer",
-            display,
+            "version-source", "version source did not produce a version string", str(source.get("path", ""))
         )
-    return str(value).strip()
+    return value.strip()
 
 
-def load_plan(repository_root: Path | str, plan_path: str | Path) -> tuple[dict[str, Any], Path]:
+def load_plan(
+    repository_root: Path | str, plan_path: str | Path = DEFAULT_PLAN_PATH
+) -> tuple[dict[str, Any], Path]:
     root = Path(repository_root)
     path = _safe_path(root, plan_path)
     display = _display_path(root, path)
-    text = _read_text(root, path)
     try:
-        if path.suffix.lower() == ".toml":
-            loaded = tomllib.loads(text)
-        else:
-            loaded = json.loads(text)
-    except (json.JSONDecodeError, tomllib.TOMLDecodeError) as exc:
+        text = _read_text(root, plan_path)
+        loaded = json.loads(text)
+    except json.JSONDecodeError as exc:
         raise GovernanceError("invalid-plan", "release plan is not valid JSON", display) from exc
     if not isinstance(loaded, dict):
         raise GovernanceError("invalid-plan", "release plan root must be an object", display)
     return loaded, path
 
 
-def _is_nonempty_string(value: Any) -> bool:
+def _nonempty(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
-def _check_exact_keys(
+def _https_url(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    parsed = urllib.parse.urlparse(value)
+    return (
+        parsed.scheme == "https"
+        and bool(parsed.netloc)
+        and parsed.username is None
+        and parsed.password is None
+        and not any(character.isspace() for character in value)
+    )
+
+
+def _is_date(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        dt.date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _is_datetime(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
+def _exact_keys(
     report: VerificationReport,
     value: Mapping[str, Any],
     required: set[str],
     allowed: set[str],
     path: str,
 ) -> None:
-    missing = sorted(required.difference(value))
-    extra = sorted(set(value).difference(allowed))
-    for name in missing:
+    for name in sorted(required.difference(value)):
         report.error("schema-required", f"required field '{name}' is missing", path)
-    for name in extra:
+    for name in sorted(set(value).difference(allowed)):
         report.error("schema-property", f"unsupported field '{name}' is present", path)
 
 
@@ -381,23 +345,22 @@ RELEASE_KEYS = {
     "classification",
     "status",
     "targetDate",
-    "milestone",
-    "releaseIssue",
-    "scenarios",
+    "integrationBranch",
+    "features",
     "blockers",
 }
 RECORD_KEYS = RELEASE_KEYS | {"releasedAt", "releaseUrl"}
-SCENARIO_KEYS = {
+FEATURE_KEYS = {
     "id",
     "type",
     "title",
     "status",
-    "issue",
+    "pullRequest",
+    "dependsOn",
     "risk",
     "acceptance",
     "evidence",
 }
-SOURCE_KEYS = {"format", "path", "pointer", "key", "pattern"}
 COMPONENT_KEYS = {
     "id",
     "currentVersion",
@@ -408,76 +371,117 @@ COMPONENT_KEYS = {
 }
 
 
-def _validate_source_shape(
-    report: VerificationReport, source: Any, path: str
-) -> None:
+def _validate_source(report: VerificationReport, source: Any, path: str) -> None:
     if not isinstance(source, Mapping):
         report.error("schema-type", "version source must be an object", path)
         return
-    source_format = source.get("format")
-    selector_contracts = {
-        "json": ({"format", "path", "pointer"}, {"format", "path", "pointer"}),
-        "toml": ({"format", "path", "key"}, {"format", "path", "key"}),
-        "text": ({"format", "path"}, {"format", "path"}),
-        "regex": ({"format", "path", "pattern"}, {"format", "path", "pattern"}),
+    contracts = {
+        "json": {"format", "path", "pointer"},
+        "toml": {"format", "path", "key"},
+        "text": {"format", "path"},
+        "regex": {"format", "path", "pattern"},
     }
-    required, allowed = selector_contracts.get(
-        source_format, ({"format", "path"}, SOURCE_KEYS)
-    )
-    _check_exact_keys(report, source, required, allowed, path)
-    if source_format not in {"json", "toml", "text", "regex"}:
+    required = contracts.get(source.get("format"), {"format", "path"})
+    _exact_keys(report, source, required, required, path)
+    if source.get("format") not in contracts:
         report.error("schema-enum", "version-source format is unsupported", path)
-    if not _is_nonempty_string(source.get("path")):
+    if not _nonempty(source.get("path")):
         report.error("schema-type", "version-source path must be non-empty", path)
-    if source_format == "json" and not isinstance(source.get("pointer"), str):
-        report.error("source-selector", "JSON version source requires 'pointer'", path)
-    if source_format == "toml" and not _is_nonempty_string(source.get("key")):
-        report.error("source-selector", "TOML version source requires 'key'", path)
-    if source_format == "regex" and not _is_nonempty_string(source.get("pattern")):
-        report.error("source-selector", "regex version source requires 'pattern'", path)
+    if source.get("format") == "json" and not isinstance(source.get("pointer"), str):
+        report.error("source-selector", "JSON version source requires pointer", path)
+    if source.get("format") == "toml" and not _nonempty(source.get("key")):
+        report.error("source-selector", "TOML version source requires key", path)
+    if source.get("format") == "regex" and not _nonempty(source.get("pattern")):
+        report.error("source-selector", "regex version source requires pattern", path)
 
 
-def _validate_scenario_shape(
-    report: VerificationReport, scenario: Any, path: str
+def _pull_number(url: Any, repository: str) -> int | None:
+    if not _https_url(url):
+        return None
+    parsed = urllib.parse.urlparse(str(url))
+    if parsed.netloc.lower() != "github.com":
+        return None
+    expected = f"/{repository}/pull/"
+    if not parsed.path.startswith(expected):
+        return None
+    suffix = parsed.path[len(expected) :].strip("/")
+    if not suffix.isdigit() or parsed.query or parsed.fragment:
+        return None
+    return int(suffix)
+
+
+def _validate_feature(
+    report: VerificationReport,
+    feature: Any,
+    repository: str,
+    path: str,
 ) -> None:
-    if not isinstance(scenario, Mapping):
-        report.error("schema-type", "scenario must be an object", path)
+    if not isinstance(feature, Mapping):
+        report.error("schema-type", "feature must be an object", path)
         return
-    _check_exact_keys(report, scenario, SCENARIO_KEYS, SCENARIO_KEYS, path)
-    scenario_id = scenario.get("id")
-    if not isinstance(scenario_id, str) or SCENARIO_ID_RE.fullmatch(scenario_id) is None:
-        report.error("scenario-id", "scenario id is invalid", path)
-    if scenario.get("type") not in SCENARIO_TYPES:
-        report.error("schema-enum", "scenario type is invalid", path)
-    title = scenario.get("title")
-    if not _is_nonempty_string(title) or len(title) > 160:
-        report.error("scenario-title", "scenario title must contain 1-160 characters", path)
-    if scenario.get("status") not in SCENARIO_STATUSES:
-        report.error("schema-enum", "scenario status is invalid", path)
-    issue = scenario.get("issue")
-    if issue is not None and not _is_https_url(issue):
-        report.error("issue-url", "scenario issue must be an HTTPS URL or null", path)
-    if scenario.get("risk") not in RISK_LEVELS:
-        report.error("schema-enum", "scenario risk is invalid", path)
-    acceptance = scenario.get("acceptance")
-    if not isinstance(acceptance, list) or not acceptance or not all(
-        _is_nonempty_string(item) for item in acceptance
+    _exact_keys(report, feature, FEATURE_KEYS, FEATURE_KEYS, path)
+    feature_id = feature.get("id")
+    if (
+        not isinstance(feature_id, str)
+        or len(feature_id) > 64
+        or FEATURE_ID_RE.fullmatch(feature_id) is None
     ):
+        report.error("feature-id", "feature id must be a lowercase slug of at most 64 characters", path)
+    if feature.get("type") not in FEATURE_TYPES:
+        report.error("schema-enum", "feature type is invalid", path)
+    title = feature.get("title")
+    if not _nonempty(title) or len(str(title)) > 160:
+        report.error("feature-title", "feature title must contain 1-160 characters", path)
+    status = feature.get("status")
+    if status not in FEATURE_STATUSES:
+        report.error("schema-enum", "feature status is invalid", path)
+    pull_request = feature.get("pullRequest")
+    if pull_request is not None and _pull_number(pull_request, repository) is None:
         report.error(
-            "scenario-acceptance",
-            "scenario acceptance must contain at least one non-empty statement",
+            "pull-request-url",
+            "feature pullRequest must be an owning-repository GitHub pull request URL or null",
             path,
         )
-    evidence = scenario.get("evidence")
-    if not isinstance(evidence, list) or not all(
-        _is_nonempty_string(item) for item in evidence
+    if status == "planned" and pull_request is not None:
+        report.error("planned-pull-request", "planned feature cannot already have a pull request", path)
+    if status in {"active", "accepted"} and pull_request is None:
+        report.error(
+            f"{status}-pull-request",
+            f"{status} feature requires its implementation pull request",
+            path,
+        )
+    if feature.get("risk") not in RISK_LEVELS:
+        report.error("schema-enum", "feature risk is invalid", path)
+    acceptance = feature.get("acceptance")
+    if not isinstance(acceptance, list) or not acceptance or not all(_nonempty(item) for item in acceptance):
+        report.error(
+            "feature-acceptance",
+            "feature acceptance must contain at least one non-empty statement",
+            path,
+        )
+    evidence = feature.get("evidence")
+    if not isinstance(evidence, list) or not all(_nonempty(item) for item in evidence):
+        report.error("feature-evidence", "feature evidence must be a string list", path)
+    if status == "accepted" and not evidence:
+        report.error("accepted-feature-evidence", "accepted feature requires reviewed evidence", path)
+    dependencies = feature.get("dependsOn")
+    if not isinstance(dependencies, list) or not all(
+        isinstance(item, str) and len(item) <= 160 and FEATURE_REF_RE.fullmatch(item)
+        for item in dependencies
     ):
-        report.error("scenario-evidence", "scenario evidence must be a string list", path)
+        report.error(
+            "feature-dependencies",
+            "dependsOn must contain canonical Owner/Repository:feature-id references",
+            path,
+        )
+    elif len(set(dependencies)) != len(dependencies):
+        report.error("feature-dependency-duplicate", "dependsOn contains a duplicate reference", path)
 
 
-def _validate_release_shape(
+def _validate_release(
     report: VerificationReport,
     release: Any,
+    repository: str,
     path: str,
     *,
     record: bool,
@@ -486,10 +490,9 @@ def _validate_release_shape(
         report.error("schema-type", "release must be an object", path)
         return
     allowed = RECORD_KEYS if record else RELEASE_KEYS
-    _check_exact_keys(report, release, allowed, allowed, path)
-    version = release.get("version")
+    _exact_keys(report, release, allowed, allowed, path)
     try:
-        parsed = SemVer.parse(version)
+        parsed = SemVer.parse(release.get("version"))
         if not parsed.stable or parsed.build:
             raise ValueError
     except (TypeError, ValueError):
@@ -501,53 +504,50 @@ def _validate_release_shape(
     target_date = release.get("targetDate")
     if target_date is not None and not _is_date(target_date):
         report.error("target-date", "target date must use YYYY-MM-DD or null", path)
-    milestone = release.get("milestone")
-    if not isinstance(milestone, str) or STABLE_MILESTONE_RE.fullmatch(milestone) is None:
-        report.error("milestone", "milestone must use vMAJOR.MINOR.PATCH", path)
-    release_issue = release.get("releaseIssue")
-    if release_issue is not None and not _is_https_url(release_issue):
-        report.error("issue-url", "release issue must be an HTTPS URL or null", path)
-    scenarios = release.get("scenarios")
-    if not isinstance(scenarios, list) or not scenarios:
-        report.error("release-scenarios", "release must contain at least one scenario", path)
-    else:
-        seen: set[str] = set()
-        for index, scenario in enumerate(scenarios):
-            scenario_path = f"{path}.scenarios[{index}]"
-            _validate_scenario_shape(report, scenario, scenario_path)
-            if isinstance(scenario, Mapping) and isinstance(scenario.get("id"), str):
-                if scenario["id"] in seen:
-                    report.error("scenario-duplicate", "scenario id is duplicated", scenario_path)
-                seen.add(scenario["id"])
-    blockers = release.get("blockers")
-    if not isinstance(blockers, list) or not all(
-        _is_nonempty_string(item) for item in blockers
+    integration_branch = release.get("integrationBranch")
+    if (
+        not isinstance(integration_branch, str)
+        or not integration_branch
+        or len(integration_branch) > 255
+        or integration_branch.startswith("/")
+        or integration_branch.endswith("/")
+        or "//" in integration_branch
+        or ".." in integration_branch
+        or re.fullmatch(r"[A-Za-z0-9._/-]+", integration_branch) is None
     ):
+        report.error("integration-branch", "integrationBranch is invalid", path)
+    features = release.get("features")
+    if not isinstance(features, list) or not features:
+        report.error("release-features", "release must contain at least one feature", path)
+    else:
+        for index, feature in enumerate(features):
+            _validate_feature(report, feature, repository, f"{path}.features[{index}]")
+    blockers = release.get("blockers")
+    if not isinstance(blockers, list) or not all(_nonempty(item) for item in blockers):
         report.error("release-blockers", "release blockers must be a string list", path)
+    if release.get("status") == "ready":
+        if blockers:
+            report.error("ready-blockers", "ready release cannot contain blockers", path)
+        if isinstance(features, list):
+            for index, feature in enumerate(features):
+                if isinstance(feature, Mapping) and feature.get("status") != "accepted":
+                    report.error(
+                        "ready-feature-status",
+                        "every ready-release feature must be accepted",
+                        f"{path}.features[{index}]",
+                    )
     if record:
         if not _is_datetime(release.get("releasedAt")):
-            report.error(
-                "released-at", "releasedAt must be an RFC 3339 date-time", path
-            )
-        if not _is_https_url(release.get("releaseUrl")):
+            report.error("released-at", "releasedAt must be an RFC 3339 date-time", path)
+        if not _https_url(release.get("releaseUrl")):
             report.error("release-url", "releaseUrl must be an HTTPS URL", path)
 
 
-def _validate_component_shape(
-    report: VerificationReport, component: Any, path: str
-) -> None:
-    if not isinstance(component, Mapping):
-        report.error("schema-type", "component must be an object", path)
-        return
-    _check_exact_keys(report, component, COMPONENT_KEYS, COMPONENT_KEYS, path)
-    component_id = component.get("id")
-    if not isinstance(component_id, str) or COMPONENT_ID_RE.fullmatch(component_id) is None:
-        report.error("component-id", "component id is invalid", path)
-    _validate_unit_shape(report, component, path)
-
-
-def _validate_unit_shape(
-    report: VerificationReport, unit: Mapping[str, Any], path: str
+def _validate_unit(
+    report: VerificationReport,
+    unit: Mapping[str, Any],
+    repository: str,
+    path: str,
 ) -> None:
     current = unit.get("currentVersion")
     if current is not None:
@@ -560,13 +560,13 @@ def _validate_unit_shape(
         report.error("schema-type", "versionSources must be an array", path)
     else:
         for index, source in enumerate(sources):
-            _validate_source_shape(report, source, f"{path}.versionSources[{index}]")
+            _validate_source(report, source, f"{path}.versionSources[{index}]")
     changelog = unit.get("changelog")
-    if changelog is not None and not _is_nonempty_string(changelog):
+    if changelog is not None and not _nonempty(changelog):
         report.error("changelog-path", "changelog must be a path or null", path)
     next_release = unit.get("nextRelease")
     if next_release is not None:
-        _validate_release_shape(report, next_release, f"{path}.nextRelease", record=False)
+        _validate_release(report, next_release, repository, f"{path}.nextRelease", record=False)
     releases = unit.get("releases")
     if not isinstance(releases, list):
         report.error("schema-type", "releases must be an array", path)
@@ -574,604 +574,330 @@ def _validate_unit_shape(
         seen: set[str] = set()
         for index, release in enumerate(releases):
             release_path = f"{path}.releases[{index}]"
-            _validate_release_shape(report, release, release_path, record=True)
+            _validate_release(report, release, repository, release_path, record=True)
             if isinstance(release, Mapping) and isinstance(release.get("version"), str):
                 if release["version"] in seen:
-                    report.error(
-                        "release-duplicate", "release version is archived more than once", release_path
-                    )
+                    report.error("release-duplicate", "release version is archived more than once", release_path)
                 seen.add(release["version"])
 
 
-def _validate_plan_shape(plan: Mapping[str, Any]) -> VerificationReport:
-    report = VerificationReport()
-    _check_exact_keys(report, plan, ROOT_KEYS, ROOT_KEYS, "plan")
-    if not _is_nonempty_string(plan.get("$schema")):
-        report.error("schema-uri", "$schema must be a non-empty URI", "plan")
-    if plan.get("schemaVersion") != 1:
-        report.error("schema-version", "schemaVersion must equal 1", "plan")
-    repository = plan.get("repository")
-    if not isinstance(repository, str) or REPOSITORY_RE.fullmatch(repository) is None:
-        report.error("repository", "repository must use owner/name", "plan")
-    profile = plan.get("profile")
-    if profile not in PROFILES:
-        report.error("profile", "release profile is unsupported", "plan")
-    _validate_unit_shape(report, plan, "plan")
-    components = plan.get("components")
-    if not isinstance(components, list):
-        report.error("schema-type", "components must be an array", "plan")
-    else:
-        seen_components: set[str] = set()
-        for index, component in enumerate(components):
-            component_path = f"plan.components[{index}]"
-            _validate_component_shape(report, component, component_path)
-            if isinstance(component, Mapping) and isinstance(component.get("id"), str):
-                if component["id"] in seen_components:
-                    report.error(
-                        "component-duplicate", "component id is duplicated", component_path
-                    )
-                seen_components.add(component["id"])
-    return report
-
-
-def _is_date(value: Any) -> bool:
-    if not isinstance(value, str):
-        return False
-    try:
-        dt.date.fromisoformat(value)
-        return bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", value))
-    except ValueError:
-        return False
-
-
-def _parse_datetime(value: str) -> dt.datetime:
-    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
-    parsed = dt.datetime.fromisoformat(normalized)
-    if parsed.tzinfo is None:
-        raise ValueError("timezone is required")
-    return parsed
-
-
-def _is_datetime(value: Any) -> bool:
-    if not isinstance(value, str):
-        return False
-    try:
-        _parse_datetime(value)
-        return "T" in value
-    except ValueError:
-        return False
-
-
-def _is_https_url(value: Any) -> bool:
-    if not isinstance(value, str):
-        return False
-    parsed = urllib.parse.urlparse(value)
-    return (
-        parsed.scheme == "https"
-        and bool(parsed.netloc)
-        and parsed.username is None
-        and parsed.password is None
-    )
-
-
-def _github_issue_number(url: Any, repository: str) -> int | None:
-    if not isinstance(url, str):
-        return None
-    parsed = urllib.parse.urlparse(url)
-    expected_path = f"/{repository}/issues/"
-    if (
-        parsed.scheme != "https"
-        or parsed.netloc.lower() != "github.com"
-        or not parsed.path.startswith(expected_path)
-        or parsed.query
-        or parsed.fragment
-    ):
-        return None
-    suffix = parsed.path[len(expected_path) :].strip("/")
-    if not suffix.isdigit() or "/" in suffix:
-        return None
-    return int(suffix)
-
-
 def _units(plan: Mapping[str, Any]) -> list[tuple[str | None, Mapping[str, Any], str]]:
-    if plan.get("profile") == "component-semver":
-        components = plan.get("components")
-        if not isinstance(components, list):
-            return []
-        return [
-            (
-                component.get("id") if isinstance(component, Mapping) else None,
-                component,
-                f"plan.components[{index}]",
-            )
-            for index, component in enumerate(components)
-            if isinstance(component, Mapping)
-        ]
-    return [(None, plan, "plan")]
+    result: list[tuple[str | None, Mapping[str, Any], str]] = [(None, plan, "plan")]
+    components = plan.get("components")
+    if isinstance(components, list):
+        for index, component in enumerate(components):
+            if isinstance(component, Mapping):
+                result.append((component.get("id"), component, f"plan.components[{index}]"))
+    return result
 
 
-def _release_tag(profile: Any, unit_id: str | None, version: Any) -> str:
-    if not isinstance(version, str):
-        raise GovernanceError("release-version", "release version is invalid")
-    if profile == "component-semver":
-        if not isinstance(unit_id, str) or COMPONENT_ID_RE.fullmatch(unit_id) is None:
-            raise GovernanceError("component-id", "release component id is invalid")
-        return f"{unit_id}-v{version}"
-    return f"v{version}"
-
-
-def _repository_matches(actual: Any, expected: Any) -> bool:
-    return (
-        isinstance(actual, str)
-        and isinstance(expected, str)
-        and REPOSITORY_RE.fullmatch(expected) is not None
-        and actual.casefold() == expected.casefold()
-    )
-
-
-def _require_expected_repository(
-    plan: Mapping[str, Any], expected_repository: str | None
-) -> None:
-    if expected_repository is None:
-        raise GovernanceError(
-            "expected-repository-required",
-            "an expected repository identity is required for this operation",
-        )
-    if not _repository_matches(plan.get("repository"), expected_repository):
-        raise GovernanceError(
-            "repository-mismatch",
-            "release plan repository does not match the expected repository",
-            "plan",
-        )
-
-
-def _check_expected_repository(
-    report: VerificationReport,
+def _release_entries(
     plan: Mapping[str, Any],
-    expected_repository: str | None,
-    *,
-    required: bool,
-) -> None:
-    if expected_repository is None:
-        if required:
-            report.error(
-                "expected-repository-required",
-                "an expected repository identity is required for GitHub verification",
-                "plan",
-            )
-        return
-    if not _repository_matches(plan.get("repository"), expected_repository):
-        report.error(
-            "repository-mismatch",
-            "release plan repository does not match the expected repository",
-            "plan",
-        )
+) -> Iterable[tuple[str | None, Mapping[str, Any], str, bool]]:
+    for unit_id, unit, unit_path in _units(plan):
+        next_release = unit.get("nextRelease")
+        if isinstance(next_release, Mapping):
+            yield unit_id, next_release, f"{unit_path}.nextRelease", False
+        releases = unit.get("releases")
+        if isinstance(releases, list):
+            for index, release in enumerate(releases):
+                if isinstance(release, Mapping):
+                    yield unit_id, release, f"{unit_path}.releases[{index}]", True
 
 
-def _require_gh_apply_mode(gh: Any, apply: bool) -> None:
-    if gh is not None and getattr(gh, "apply", None) is not apply:
-        raise GovernanceError(
-            "github-apply-mismatch",
-            "injected GitHub client mode does not match the requested apply mode",
-        )
+def _feature_entries(
+    plan: Mapping[str, Any],
+) -> Iterable[tuple[str, Mapping[str, Any], str, Mapping[str, Any], bool]]:
+    for _, release, release_path, archived in _release_entries(plan):
+        features = release.get("features")
+        if not isinstance(features, list):
+            continue
+        for index, feature in enumerate(features):
+            if isinstance(feature, Mapping) and isinstance(feature.get("id"), str):
+                yield (
+                    feature["id"],
+                    feature,
+                    f"{release_path}.features[{index}]",
+                    release,
+                    archived,
+                )
 
 
-def _validate_profile_contract(
-    report: VerificationReport, plan: Mapping[str, Any]
-) -> None:
+def _validate_profile(report: VerificationReport, plan: Mapping[str, Any]) -> None:
     profile = plan.get("profile")
     components = plan.get("components")
     if profile == "semver":
         if components:
-            report.error(
-                "profile-components",
-                "semver profile cannot declare independently versioned components",
-                "plan",
-            )
+            report.error("profile-components", "semver profile cannot declare components", "plan")
     elif profile == "component-semver":
         if not isinstance(components, list) or not components:
-            report.error(
-                "profile-components",
-                "component-semver profile requires at least one component",
-                "plan",
-            )
+            report.error("profile-components", "component-semver requires components", "plan")
         for name in ("currentVersion", "changelog", "nextRelease"):
             if plan.get(name) is not None:
-                report.error(
-                    "profile-root-version",
-                    f"component-semver profile requires root {name} to be null",
-                    "plan",
-                )
+                report.error("profile-root-version", f"component-semver requires root {name} null", "plan")
         for name in ("versionSources", "releases"):
             if plan.get(name) != []:
-                report.error(
-                    "profile-root-version",
-                    f"component-semver profile requires root {name} to be empty",
-                    "plan",
-                )
+                report.error("profile-root-version", f"component-semver requires root {name} empty", "plan")
     elif profile in {"governance", "continuous-site", "inactive"}:
         for name in ("currentVersion", "changelog", "nextRelease"):
             if plan.get(name) is not None:
-                report.error(
-                    "profile-version",
-                    f"{profile} profile cannot declare {name}",
-                    "plan",
-                )
+                report.error("profile-version", f"{profile} cannot declare {name}", "plan")
         for name in ("versionSources", "releases", "components"):
             if plan.get(name) != []:
-                report.error(
-                    "profile-version",
-                    f"{profile} profile requires {name} to be empty",
-                    "plan",
-                )
+                report.error("profile-version", f"{profile} requires {name} empty", "plan")
 
 
-def _validate_scenario_mix(
-    report: VerificationReport,
-    release: Mapping[str, Any],
-    inferred: str,
-    path: str,
+def _validate_feature_mix(
+    report: VerificationReport, release: Mapping[str, Any], classification: str, path: str
 ) -> None:
-    scenarios = release.get("scenarios")
-    if not isinstance(scenarios, list):
+    features = release.get("features")
+    if not isinstance(features, list):
         return
-    types = [
-        scenario.get("type")
-        for scenario in scenarios
-        if isinstance(scenario, Mapping)
-    ]
-    if inferred == "patch":
-        if not types or any(item != "fix" for item in types):
-            report.error(
-                "patch-scenarios",
-                "patch releases require one or more fixes and prohibit capabilities or breaking changes",
-                path,
-            )
-    elif inferred == "minor":
-        if "capability" not in types or "breaking" in types:
-            report.error(
-                "minor-scenarios",
-                "minor releases require a capability and prohibit breaking scenarios",
-                path,
-            )
-    elif inferred == "major":
-        if "breaking" not in types:
-            report.error(
-                "major-scenarios",
-                "major releases require at least one breaking scenario",
-                path,
-            )
-    elif inferred in {"initial", "stabilization"}:
-        if "capability" not in types:
-            report.error(
-                f"{inferred}-scenarios",
-                f"{inferred} releases require at least one capability scenario",
-                path,
-            )
-
-
-def _validate_ready(
-    report: VerificationReport,
-    release: Mapping[str, Any],
-    repository: str,
-    path: str,
-) -> None:
-    if release.get("status") != "ready":
-        return
-    blockers = release.get("blockers")
-    if blockers:
-        report.error("ready-blockers", "ready release cannot contain blockers", path)
-    if _github_issue_number(release.get("releaseIssue"), repository) is None:
+    types = [item.get("type") for item in features if isinstance(item, Mapping)]
+    if classification == "patch" and (not types or any(item != "fix" for item in types)):
+        report.error("patch-features", "patch releases require fixes only", path)
+    elif classification == "minor" and ("capability" not in types or "breaking" in types):
+        report.error("minor-features", "minor releases require a capability and prohibit breaking features", path)
+    elif classification == "major" and "breaking" not in types:
+        report.error("major-features", "major releases require a breaking feature", path)
+    elif classification in {"initial", "stabilization"} and "capability" not in types:
         report.error(
-            "ready-release-issue",
-            "ready release requires an owning-repository release issue URL",
+            f"{classification}-features",
+            f"{classification} releases require a capability feature",
             path,
         )
-    scenarios = release.get("scenarios")
-    if not isinstance(scenarios, list):
-        return
-    for index, scenario in enumerate(scenarios):
-        scenario_path = f"{path}.scenarios[{index}]"
-        if not isinstance(scenario, Mapping):
-            continue
-        if scenario.get("status") != "accepted":
-            report.error(
-                "ready-scenario-status",
-                "every ready-release scenario must be accepted",
-                scenario_path,
-            )
-        if _github_issue_number(scenario.get("issue"), repository) is None:
-            report.error(
-                "ready-scenario-issue",
-                "every ready-release scenario requires an owning-repository issue URL",
-                scenario_path,
-            )
-        evidence = scenario.get("evidence")
-        if not isinstance(evidence, list) or not evidence or not all(
-            _is_nonempty_string(item) for item in evidence
-        ):
-            report.error(
-                "ready-scenario-evidence",
-                "every accepted scenario requires reviewed evidence",
-                scenario_path,
-            )
 
 
-def _validate_ready_issue_uniqueness(
-    report: VerificationReport, plan: Mapping[str, Any]
-) -> None:
+def _validate_release_contracts(report: VerificationReport, plan: Mapping[str, Any]) -> None:
+    for _, unit, unit_path in _units(plan):
+        current = unit.get("currentVersion")
+        next_release = unit.get("nextRelease")
+        if isinstance(next_release, Mapping) and isinstance(next_release.get("version"), str):
+            try:
+                inferred = classify_transition(current, next_release["version"])
+            except (TypeError, ValueError):
+                report.error("version-transition", "next release transition is invalid", f"{unit_path}.nextRelease")
+            else:
+                if next_release.get("classification") != inferred:
+                    report.error(
+                        "classification",
+                        "declared classification does not match the version transition",
+                        f"{unit_path}.nextRelease",
+                    )
+                _validate_feature_mix(report, next_release, inferred, f"{unit_path}.nextRelease")
+
+
+def _validate_feature_graph(report: VerificationReport, plan: Mapping[str, Any]) -> None:
     repository = plan.get("repository")
     if not isinstance(repository, str):
         return
-    seen: dict[int | str, str] = {}
-    for _, unit, unit_path in _units(plan):
-        release = unit.get("nextRelease")
-        if not isinstance(release, Mapping) or release.get("status") != "ready":
-            continue
-        candidates: list[tuple[Any, str]] = [
-            (release.get("releaseIssue"), f"{unit_path}.nextRelease.releaseIssue")
-        ]
-        scenarios = release.get("scenarios")
-        if isinstance(scenarios, list):
-            candidates.extend(
-                (
-                    scenario.get("issue") if isinstance(scenario, Mapping) else None,
-                    f"{unit_path}.nextRelease.scenarios[{index}].issue",
-                )
-                for index, scenario in enumerate(scenarios)
-            )
-        for issue_url, issue_path in candidates:
-            if not isinstance(issue_url, str):
-                continue
-            issue_number = _github_issue_number(issue_url, repository)
-            identity: int | str = (
-                issue_number if issue_number is not None else issue_url
-            )
-            previous = seen.get(identity)
-            if previous is not None:
+    entries = list(_feature_entries(plan))
+    by_id: dict[str, tuple[Mapping[str, Any], str]] = {}
+    pull_requests: dict[str, str] = {}
+    for feature_id, feature, path, _, _ in entries:
+        if feature_id in by_id:
+            report.error("feature-duplicate", "feature id must be globally unique in one repository plan", path)
+        else:
+            by_id[feature_id] = (feature, path)
+        pull_request = feature.get("pullRequest")
+        if isinstance(pull_request, str):
+            if pull_request in pull_requests:
                 report.error(
-                    "ready-issue-duplicate",
-                    "ready release and scenario issue URLs must be globally unique",
-                    issue_path,
-                )
-                report.error(
-                    "ready-issue-duplicate",
-                    "ready release and scenario issue URLs must be globally unique",
-                    previous,
+                    "pull-request-duplicate",
+                    "one pull request cannot implement multiple features",
+                    path,
                 )
             else:
-                seen[identity] = issue_path
+                pull_requests[pull_request] = path
+
+    adjacency: dict[str, list[str]] = {feature_id: [] for feature_id in by_id}
+    for feature_id, (feature, path) in by_id.items():
+        own_reference = f"{repository}:{feature_id}"
+        dependencies = feature.get("dependsOn")
+        if not isinstance(dependencies, list):
+            continue
+        for dependency in dependencies:
+            if dependency == own_reference:
+                report.error("feature-self-dependency", "feature cannot depend on itself", path)
+                continue
+            match = FEATURE_REF_RE.fullmatch(dependency) if isinstance(dependency, str) else None
+            if match is None or match.group("repository") != repository:
+                continue
+            target = match.group("feature")
+            if target not in by_id:
+                report.error("feature-dependency-missing", "local feature dependency does not exist", path)
+                continue
+            adjacency[feature_id].append(target)
+            if feature.get("status") == "accepted" and by_id[target][0].get("status") != "accepted":
+                report.error(
+                    "feature-dependency-unaccepted",
+                    "accepted feature depends on a local feature that is not accepted",
+                    path,
+                )
+
+    state: dict[str, int] = {}
+
+    def visit(node: str) -> None:
+        state[node] = 1
+        for target in adjacency[node]:
+            if state.get(target) == 1:
+                report.error("feature-dependency-cycle", "feature dependency graph contains a cycle", by_id[node][1])
+            elif state.get(target, 0) == 0:
+                visit(target)
+        state[node] = 2
+
+    for feature_id in adjacency:
+        if state.get(feature_id, 0) == 0:
+            visit(feature_id)
 
 
 def _expected_source_version(unit: Mapping[str, Any]) -> str | None:
     release = unit.get("nextRelease")
     if isinstance(release, Mapping) and release.get("status") == "ready":
-        version = release.get("version")
-        return version if isinstance(version, str) else None
+        return release.get("version") if isinstance(release.get("version"), str) else None
     current = unit.get("currentVersion")
     return current if isinstance(current, str) else None
 
 
-def _validate_changelog(
-    report: VerificationReport,
-    root: Path,
-    changelog: Any,
-    expected: str | None,
-    path: str,
+def _validate_sources_and_changelog(
+    report: VerificationReport, root: Path, plan: Mapping[str, Any]
 ) -> None:
-    if changelog is None or expected is None:
-        return
-    if not isinstance(changelog, str):
-        return
-    try:
-        text = _read_text(root, changelog)
-    except GovernanceError as exc:
-        report.error(exc.code, exc.message, exc.path)
-        return
-    heading = re.compile(
-        rf"(?mi)^#{{1,6}}\s+(?:\[\s*)?v?{re.escape(expected)}"
-        rf"(?:\s*\])?(?=\s|$|-)"
-    )
-    if heading.search(text) is None:
-        report.error(
-            "changelog-version",
-            f"changelog has no heading for expected version {expected}",
-            _display_path(root, _safe_path(root, changelog)),
-        )
-
-
-def _validate_version_sources(
-    report: VerificationReport,
-    root: Path,
-    unit: Mapping[str, Any],
-    unit_path: str,
-) -> None:
-    expected = _expected_source_version(unit)
-    if expected is None:
-        return
-    sources = unit.get("versionSources")
-    if not isinstance(sources, list):
-        return
-    if not sources:
-        report.error(
-            "version-source-required",
-            "versioned release unit requires at least one version source",
-            unit_path,
-        )
-    for index, source in enumerate(sources):
-        if not isinstance(source, Mapping):
-            continue
-        try:
-            actual = read_version_source(root, source)
-        except GovernanceError as exc:
-            report.error(exc.code, exc.message, exc.path)
-            continue
-        if actual != expected:
-            relative = source.get("path")
-            display = (
-                _display_path(root, _safe_path(root, relative))
-                if isinstance(relative, str)
-                else unit_path
-            )
-            report.error(
-                "version-source-drift",
-                f"version source must equal expected version {expected}",
-                display,
-            )
-    _validate_changelog(
-        report,
-        root,
-        unit.get("changelog"),
-        expected,
-        unit_path,
-    )
-
-
-def _validate_release_contracts(
-    report: VerificationReport,
-    plan: Mapping[str, Any],
-    root: Path,
-) -> None:
-    repository = plan.get("repository")
-    if not isinstance(repository, str):
-        return
     for _, unit, unit_path in _units(plan):
-        release = unit.get("nextRelease")
-        if isinstance(release, Mapping):
-            current = unit.get("currentVersion")
-            target = release.get("version")
-            try:
-                inferred = classify_transition(current, target)
-            except (TypeError, ValueError) as exc:
-                report.error("version-transition", str(exc), f"{unit_path}.nextRelease")
-            else:
-                if release.get("classification") != inferred:
+        expected = _expected_source_version(unit)
+        sources = unit.get("versionSources")
+        if isinstance(sources, list):
+            for index, source in enumerate(sources):
+                if not isinstance(source, Mapping):
+                    continue
+                try:
+                    actual = read_version_source(root, source)
+                except GovernanceError as exc:
+                    report.error(exc.code, exc.message, exc.path or f"{unit_path}.versionSources[{index}]")
+                    continue
+                if expected is not None and actual != expected:
                     report.error(
-                        "classification",
-                        f"declared classification must be {inferred}",
-                        f"{unit_path}.nextRelease",
+                        "version-source-drift",
+                        "version source does not match the required release version",
+                        f"{unit_path}.versionSources[{index}]",
                     )
-                _validate_scenario_mix(
-                    report, release, inferred, f"{unit_path}.nextRelease"
-                )
-            if isinstance(target, str) and release.get("milestone") != f"v{target}":
-                report.error(
-                    "milestone-version",
-                    "milestone must exactly equal v<release version>",
-                    f"{unit_path}.nextRelease",
-                )
-            _validate_ready(
-                report, release, repository, f"{unit_path}.nextRelease"
-            )
-        _validate_version_sources(report, root, unit, unit_path)
-    _validate_ready_issue_uniqueness(report, plan)
+        changelog = unit.get("changelog")
+        release = unit.get("nextRelease")
+        if (
+            isinstance(changelog, str)
+            and isinstance(release, Mapping)
+            and release.get("status") == "ready"
+            and isinstance(release.get("version"), str)
+        ):
+            try:
+                text = _read_text(root, changelog)
+            except GovernanceError as exc:
+                report.error(exc.code, exc.message, exc.path)
+            else:
+                if release["version"] not in text:
+                    report.error("changelog-version", "changelog does not name the ready version", changelog)
+
+
+def _validate_shape(plan: Mapping[str, Any]) -> VerificationReport:
+    report = VerificationReport()
+    _exact_keys(report, plan, ROOT_KEYS, ROOT_KEYS, "plan")
+    if not _nonempty(plan.get("$schema")):
+        report.error("schema-uri", "$schema must be a non-empty URI", "plan")
+    if plan.get("schemaVersion") != 2:
+        report.error("schema-version", "schemaVersion must equal 2", "plan")
+    repository = plan.get("repository")
+    if not isinstance(repository, str) or REPOSITORY_RE.fullmatch(repository) is None:
+        report.error("repository", "repository must use owner/name", "plan")
+        repository = ""
+    if plan.get("profile") not in PROFILES:
+        report.error("profile", "release profile is unsupported", "plan")
+    _validate_unit(report, plan, repository, "plan")
+    components = plan.get("components")
+    if not isinstance(components, list):
+        report.error("schema-type", "components must be an array", "plan")
+    else:
+        seen: set[str] = set()
+        for index, component in enumerate(components):
+            path = f"plan.components[{index}]"
+            if not isinstance(component, Mapping):
+                report.error("schema-type", "component must be an object", path)
+                continue
+            _exact_keys(report, component, COMPONENT_KEYS, COMPONENT_KEYS, path)
+            component_id = component.get("id")
+            if not isinstance(component_id, str) or COMPONENT_ID_RE.fullmatch(component_id) is None:
+                report.error("component-id", "component id is invalid", path)
+            elif component_id in seen:
+                report.error("component-duplicate", "component id is duplicated", path)
+            else:
+                seen.add(component_id)
+            _validate_unit(report, component, repository, path)
+    return report
+
+
+def _feature_progress(release: Mapping[str, Any]) -> tuple[int, int, int]:
+    features = release.get("features")
+    if not isinstance(features, list):
+        return 0, 0, 0
+    total = len(features)
+    accepted = sum(
+        1 for feature in features if isinstance(feature, Mapping) and feature.get("status") == "accepted"
+    )
+    percent = round(accepted * 100 / total) if total else 0
+    return accepted, total, percent
 
 
 def _release_rows(release: Mapping[str, Any]) -> list[str]:
-    scenarios = release.get("scenarios")
-    if not isinstance(scenarios, list):
-        return []
     rows: list[str] = []
-    for scenario in scenarios:
-        if not isinstance(scenario, Mapping):
+    features = release.get("features")
+    if not isinstance(features, list):
+        return rows
+    for feature in features:
+        if not isinstance(feature, Mapping):
             continue
-        issue = scenario.get("issue")
-        issue_text = f"[issue]({issue})" if _is_https_url(issue) else "—"
-        evidence = scenario.get("evidence")
-        evidence_count = len(evidence) if isinstance(evidence, list) else 0
-        values = (
-            str(scenario.get("id", "—")),
-            str(scenario.get("type", "—")),
-            str(scenario.get("title", "—")).replace("|", r"\|").replace("\n", " "),
-            str(scenario.get("status", "—")),
-            str(scenario.get("risk", "—")),
-            issue_text,
-            str(evidence_count),
-        )
-        rows.append("| " + " | ".join(values) + " |")
+        pull_request = feature.get("pullRequest")
+        pull_text = f"[PR]({pull_request})" if _https_url(pull_request) else "—"
+        dependencies = feature.get("dependsOn")
+        dependency_text = "<br>".join(str(item) for item in dependencies) if dependencies else "—"
+        evidence = feature.get("evidence")
+        evidence_text = "<br>".join(str(item) for item in evidence) if evidence else "—"
+        cells = [
+            str(feature.get("id", "—")),
+            str(feature.get("type", "—")),
+            str(feature.get("title", "—")).replace("|", r"\|").replace("\n", " "),
+            str(feature.get("status", "—")),
+            str(feature.get("risk", "—")),
+            pull_text,
+            dependency_text,
+            evidence_text,
+        ]
+        rows.append("| " + " | ".join(cells) + " |")
     return rows
 
 
-def _render_release_section(
-    lines: list[str], heading: str, release: Mapping[str, Any] | None
-) -> None:
+def _render_release(lines: list[str], release: Any, heading: str) -> None:
     lines.extend([f"## {heading}", ""])
-    if release is None:
+    if not isinstance(release, Mapping):
         lines.extend(["No release is currently planned.", ""])
         return
+    accepted, total, percent = _feature_progress(release)
     lines.extend(
         [
             f"- Version: `{release.get('version', '—')}`",
             f"- Classification: `{release.get('classification', '—')}`",
             f"- Status: `{release.get('status', '—')}`",
             f"- Target date: `{release.get('targetDate') or 'not set'}`",
-            f"- Milestone: `{release.get('milestone', '—')}`",
-        ]
-    )
-    release_issue = release.get("releaseIssue")
-    lines.append(
-        f"- Release issue: [owning issue]({release_issue})"
-        if _is_https_url(release_issue)
-        else "- Release issue: not linked"
-    )
-    lines.extend(
-        [
+            f"- Integration branch: `{release.get('integrationBranch', '—')}`",
+            f"- Progress: `{accepted}/{total}` accepted (`{percent}%`)",
             "",
-            "| ID | Type | Outcome | Status | Risk | Issue | Evidence |",
-            "| --- | --- | --- | --- | --- | --- | ---: |",
+            "| ID | Type | Feature | Status | Risk | Pull request | Depends on | Evidence |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
     )
     lines.extend(_release_rows(release))
     blockers = release.get("blockers")
-    lines.extend(["", "### Blockers", ""])
     if isinstance(blockers, list) and blockers:
+        lines.extend(["", "### Blockers", ""])
         lines.extend(f"- {item}" for item in blockers)
-    else:
-        lines.append("None.")
     lines.append("")
-
-
-def render_release_document(plan: Mapping[str, Any]) -> str:
-    """Render the fixed human-readable projection of a plan."""
-
-    profile = plan.get("profile", "unknown")
-    current = plan.get("currentVersion")
-    lines = [
-        "<!-- Generated by tools/release_governance.py; edit plan.json, not this file. -->",
-        "# Release status",
-        "",
-        f"- Repository: `{plan.get('repository', 'unknown')}`",
-        f"- Profile: `{profile}`",
-        f"- Current version: `{current or 'not versioned'}`",
-        "",
-    ]
-    if profile == "component-semver":
-        components = plan.get("components")
-        if isinstance(components, list):
-            for component in components:
-                if not isinstance(component, Mapping):
-                    continue
-                component_id = component.get("id", "unknown")
-                lines.extend(
-                    [
-                        f"## Component `{component_id}`",
-                        "",
-                        f"- Current version: `{component.get('currentVersion') or 'not released'}`",
-                        "",
-                    ]
-                )
-                _render_release_section(
-                    lines, "Next release", component.get("nextRelease")
-                )
-                _render_history(lines, component.get("releases"))
-    else:
-        _render_release_section(
-            lines,
-            "Next release",
-            plan.get("nextRelease") if isinstance(plan.get("nextRelease"), Mapping) else None,
-        )
-        _render_history(lines, plan.get("releases"))
-    return "\n".join(lines).rstrip() + "\n"
 
 
 def _render_history(lines: list[str], releases: Any) -> None:
@@ -1179,56 +905,65 @@ def _render_history(lines: list[str], releases: Any) -> None:
     if not isinstance(releases, list) or not releases:
         lines.extend(["No releases have been archived.", ""])
         return
-    lines.extend(
-        [
-            "| Version | Classification | Released at | GitHub Release |",
-            "| --- | --- | --- | --- |",
-        ]
-    )
     for release in releases:
         if not isinstance(release, Mapping):
             continue
-        release_reference = release.get("releaseUrl")
-        url_text = (
-            f"[release]({release_reference})"
-            if _is_https_url(release_reference)
-            else "—"
+        release_url = release.get("releaseUrl")
+        title = (
+            f"[{release.get('version')}]({release_url})"
+            if _https_url(release_url)
+            else str(release.get("version", "—"))
         )
-        lines.append(
-            "| "
-            + " | ".join(
-                (
-                    str(release.get("version", "—")),
-                    str(release.get("classification", "—")),
-                    str(release.get("releasedAt", "—")),
-                    url_text,
-                )
-            )
-            + " |"
+        lines.extend(
+            [
+                f"### {title}",
+                "",
+                f"- Released: `{release.get('releasedAt', '—')}`",
+                f"- Classification: `{release.get('classification', '—')}`",
+                "",
+            ]
         )
-    lines.append("")
 
 
-def _document_drift(
-    report: VerificationReport, root: Path, plan: Mapping[str, Any]
-) -> None:
+def render_release_document(plan: Mapping[str, Any]) -> str:
+    """Render the fixed human-readable projection of a plan."""
+
+    lines = [
+        "<!-- Generated by tools/release_governance.py; edit plan.json, not this file. -->",
+        "# Release status",
+        "",
+        f"- Repository: `{plan.get('repository', '—')}`",
+        f"- Profile: `{plan.get('profile', '—')}`",
+        f"- Current version: `{plan.get('currentVersion') or 'not versioned'}`",
+        "",
+    ]
+    if plan.get("profile") == "component-semver":
+        components = plan.get("components")
+        if isinstance(components, list):
+            for component in components:
+                if not isinstance(component, Mapping):
+                    continue
+                lines.extend([f"## Component `{component.get('id', '—')}`", ""])
+                _render_release(lines, component.get("nextRelease"), "Next release")
+                _render_history(lines, component.get("releases"))
+    else:
+        _render_release(lines, plan.get("nextRelease"), "Next release")
+        _render_history(lines, plan.get("releases"))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _document_drift(root: Path, plan: Mapping[str, Any]) -> VerificationReport:
+    report = VerificationReport()
     expected = render_release_document(plan)
     path = _safe_path(root, DOCUMENT_PATH)
-    display = _display_path(root, path)
     try:
         actual = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        report.error("document-missing", "generated release document is missing", display)
-        return
-    except (OSError, UnicodeError):
-        report.error("document-unreadable", "generated release document cannot be read", display)
-        return
-    if actual != expected:
-        report.error(
-            "document-drift",
-            "generated release document does not match the release plan",
-            display,
-        )
+    except OSError:
+        report.error("document-missing", "generated release document is missing", DOCUMENT_PATH)
+    else:
+        if actual != expected:
+            report.error("document-drift", "generated release document is stale", DOCUMENT_PATH)
+    return report
 
 
 def verify_plan(
@@ -1238,101 +973,66 @@ def verify_plan(
     check_document: bool = True,
 ) -> VerificationReport:
     root = Path(repository_root)
-    report = _validate_plan_shape(plan)
-    _validate_profile_contract(report, plan)
-    _validate_release_contracts(report, plan, root)
+    report = _validate_shape(plan)
+    _validate_profile(report, plan)
+    _validate_release_contracts(report, plan)
+    _validate_feature_graph(report, plan)
+    _validate_sources_and_changelog(report, root, plan)
     if check_document:
-        _document_drift(report, root, plan)
+        report.extend(_document_drift(root, plan))
     return report
 
 
-def _atomic_write(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    mode = path.stat().st_mode & 0o777 if path.exists() else 0o644
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(content)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.chmod(temporary, mode)
-        os.replace(temporary, path)
-    except BaseException:
-        try:
-            temporary.unlink(missing_ok=True)
-        finally:
-            raise
+def _release_tag(profile: Any, unit_id: str | None, version: Any) -> str:
+    if profile == "component-semver":
+        return f"{unit_id}-v{version}"
+    return f"v{version}"
+
+
+def _validate_tag_locally(report: VerificationReport, plan: Mapping[str, Any], tag: str) -> None:
+    if plan.get("profile") not in {"semver", "component-semver"}:
+        report.error("tag-profile", "non-versioned release profiles reject product tags", "plan")
+        return
+    matches = [
+        release
+        for unit_id, unit, _ in _units(plan)
+        for release in [unit.get("nextRelease")]
+        if isinstance(release, Mapping)
+        and release.get("status") == "ready"
+        and tag == _release_tag(plan.get("profile"), unit_id, release.get("version"))
+    ]
+    if len(matches) != 1:
+        report.error("tag-version", "tag must identify exactly one ready release", "plan")
 
 
 class GhClient:
-    """Minimal safe ``gh`` adapter with dry-run mutation recording."""
+    """A narrow, dry-run-aware GitHub CLI adapter."""
 
-    def __init__(
-        self,
-        *,
-        apply: bool,
-        executable: str = "gh",
-        timeout: int = 30,
-    ):
+    def __init__(self, *, apply: bool = False):
         self.apply = apply
-        self.executable = executable
-        self.timeout = timeout
         self.operations: list[str] = []
 
     def _execute(self, arguments: Sequence[str]) -> str:
         try:
             completed = subprocess.run(
-                [self.executable, *arguments],
-                check=False,
+                ["gh", *arguments],
+                check=True,
                 capture_output=True,
                 text=True,
                 shell=False,
-                timeout=self.timeout,
             )
-        except FileNotFoundError as exc:
-            raise GovernanceError(
-                "github-unavailable", "GitHub CLI is not available"
-            ) from exc
-        except subprocess.TimeoutExpired as exc:
-            raise GovernanceError("github-timeout", "GitHub CLI request timed out") from exc
-        except OSError as exc:
-            raise GovernanceError(
-                "github-unavailable", "GitHub CLI could not be started"
-            ) from exc
-        if completed.returncode != 0:
-            stderr = (completed.stderr or "").lower()
-            if "authentication" in stderr or "authenticate" in stderr or "http 401" in stderr:
-                code = "github-auth"
-                message = "GitHub authentication is unavailable"
-            elif "forbidden" in stderr or "http 403" in stderr or "resource not accessible" in stderr:
-                code = "github-permission"
-                message = "GitHub permission is insufficient"
-            elif "rate limit" in stderr:
-                code = "github-rate-limit"
-                message = "GitHub API rate limit was reached"
-            elif "not found" in stderr or "http 404" in stderr:
-                code = "github-not-found"
-                message = "required GitHub resource was not found"
-            else:
-                code = "github-command"
-                message = "GitHub CLI request failed"
-            raise GovernanceError(code, message)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise GovernanceError("github-command", "GitHub CLI request failed") from exc
         return completed.stdout
 
     def text(self, arguments: Sequence[str]) -> str:
         return self._execute(arguments)
 
     def json(self, arguments: Sequence[str]) -> Any:
-        output = self._execute(arguments)
         try:
-            return json.loads(output)
+            return json.loads(self._execute(arguments))
         except json.JSONDecodeError as exc:
-            raise GovernanceError(
-                "github-response", "GitHub CLI returned an invalid response"
-            ) from exc
+            raise GovernanceError("github-response", "GitHub CLI returned invalid JSON") from exc
 
     def mutate_text(self, operation: str, arguments: Sequence[str]) -> str | None:
         self.operations.append(operation)
@@ -1347,9 +1047,185 @@ class GhClient:
         try:
             return json.loads(output)
         except json.JSONDecodeError as exc:
-            raise GovernanceError(
-                "github-response", "GitHub CLI returned an invalid response"
-            ) from exc
+            raise GovernanceError("github-response", "GitHub CLI returned invalid JSON") from exc
+
+
+def _require_mode(gh: Any, apply: bool) -> None:
+    if gh is not None and getattr(gh, "apply", None) is not apply:
+        raise GovernanceError("github-apply-mismatch", "injected GitHub client mode does not match")
+
+
+def _check_expected_repository(
+    report: VerificationReport,
+    plan: Mapping[str, Any],
+    expected: str | None,
+    *,
+    required: bool,
+) -> None:
+    if required and not expected:
+        report.error("expected-repository-required", "expected repository identity is required", "plan")
+    elif expected and plan.get("repository") != expected:
+        report.error("repository-mismatch", "plan repository does not match expected repository", "plan")
+
+
+def _require_expected_repository(plan: Mapping[str, Any], expected: str | None) -> None:
+    if not expected:
+        raise GovernanceError("expected-repository-required", "expected repository identity is required")
+    if plan.get("repository") != expected:
+        raise GovernanceError("repository-mismatch", "plan repository does not match expected repository")
+
+
+def _read_remote_plan(gh: GhClient, repository: str) -> Mapping[str, Any]:
+    try:
+        metadata = gh.json(["api", f"repos/{repository}"])
+        branch = metadata.get("default_branch") if isinstance(metadata, Mapping) else None
+        if not isinstance(branch, str) or not branch:
+            raise GovernanceError("github-response", "dependency repository metadata is invalid")
+        encoded_branch = urllib.parse.quote(branch, safe="")
+        content = gh.json(
+            [
+                "api",
+                f"repos/{repository}/contents/{DEFAULT_PLAN_PATH}?ref={encoded_branch}",
+            ]
+        )
+    except GovernanceError:
+        raise
+    if not isinstance(content, Mapping) or content.get("encoding") != "base64":
+        raise GovernanceError("github-response", "dependency release plan response is invalid")
+    encoded = content.get("content")
+    if not isinstance(encoded, str) or len(encoded) > MAX_SOURCE_BYTES * 2:
+        raise GovernanceError("dependency-plan-size", "dependency release plan exceeds verification limit")
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+        if len(raw) > MAX_SOURCE_BYTES:
+            raise ValueError
+        loaded = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
+        raise GovernanceError("dependency-plan", "dependency release plan is invalid") from exc
+    if not isinstance(loaded, Mapping) or loaded.get("repository") != repository:
+        raise GovernanceError("dependency-plan", "dependency release plan identity is invalid")
+    remote_report = _validate_shape(loaded)
+    _validate_profile(remote_report, loaded)
+    _validate_release_contracts(remote_report, loaded)
+    _validate_feature_graph(remote_report, loaded)
+    if not remote_report.ok:
+        raise GovernanceError(
+            "dependency-plan",
+            "dependency release plan does not satisfy the current schema and policy",
+        )
+    return loaded
+
+
+def _remote_dependency_graph(
+    report: VerificationReport,
+    plan: Mapping[str, Any],
+    gh: GhClient,
+) -> dict[str, tuple[Mapping[str, Any], str, Mapping[str, Any]]]:
+    root_repository = plan.get("repository")
+    if not isinstance(root_repository, str):
+        return {}
+    plans: dict[str, Mapping[str, Any]] = {root_repository: plan}
+    indexes: dict[str, dict[str, tuple[Mapping[str, Any], str, Mapping[str, Any]]]] = {}
+    total_indexed_features = 0
+
+    def index_repository(
+        repository: str,
+    ) -> dict[str, tuple[Mapping[str, Any], str, Mapping[str, Any]]] | None:
+        nonlocal total_indexed_features
+        if repository in indexes:
+            return indexes[repository]
+        if repository not in plans:
+            if len(plans) >= MAX_DEPENDENCY_REPOSITORIES:
+                report.error("dependency-limit", "dependency graph exceeds repository limit", "plan")
+                return None
+            try:
+                plans[repository] = _read_remote_plan(gh, repository)
+            except GovernanceError as exc:
+                report.error(exc.code, exc.message, "plan")
+                return None
+        index: dict[str, tuple[Mapping[str, Any], str, Mapping[str, Any]]] = {}
+        for feature_id, feature, path, release, _ in _feature_entries(plans[repository]):
+            index[feature_id] = (feature, path, release)
+            total_indexed_features += 1
+            if total_indexed_features > MAX_DEPENDENCY_FEATURES:
+                report.error("dependency-limit", "dependency graph exceeds feature limit", "plan")
+                return None
+        indexes[repository] = index
+        return index
+
+    graph: dict[str, tuple[Mapping[str, Any], str, Mapping[str, Any]]] = {}
+    adjacency: dict[str, list[str]] = {}
+    pending: list[str] = []
+    for feature_id, _, _, release, archived in _feature_entries(plan):
+        if not archived and release is plan.get("nextRelease"):
+            pending.append(f"{root_repository}:{feature_id}")
+    components = plan.get("components")
+    if isinstance(components, list):
+        for component in components:
+            if not isinstance(component, Mapping):
+                continue
+            next_release = component.get("nextRelease")
+            if not isinstance(next_release, Mapping):
+                continue
+            features = next_release.get("features")
+            if isinstance(features, list):
+                for feature in features:
+                    if isinstance(feature, Mapping) and isinstance(feature.get("id"), str):
+                        pending.append(f"{root_repository}:{feature['id']}")
+
+    visited: set[str] = set()
+    while pending:
+        reference = pending.pop()
+        if reference in visited:
+            continue
+        visited.add(reference)
+        match = FEATURE_REF_RE.fullmatch(reference)
+        if match is None:
+            continue
+        repository = match.group("repository")
+        index = index_repository(repository)
+        if index is None:
+            continue
+        data = index.get(match.group("feature"))
+        if data is None:
+            report.error("feature-dependency-missing", "feature dependency does not exist", "plan")
+            continue
+        graph[reference] = data
+        adjacency[reference] = []
+        dependencies = data[0].get("dependsOn")
+        if isinstance(dependencies, list):
+            pending.extend(item for item in dependencies if isinstance(item, str))
+
+    for reference, (feature, path, _) in graph.items():
+        dependencies = feature.get("dependsOn")
+        if not isinstance(dependencies, list):
+            continue
+        for dependency in dependencies:
+            if dependency not in graph:
+                report.error("feature-dependency-missing", "feature dependency does not exist", path)
+                continue
+            adjacency[reference].append(dependency)
+            if feature.get("status") == "accepted" and graph[dependency][0].get("status") != "accepted":
+                report.error(
+                    "feature-dependency-unaccepted",
+                    "accepted feature depends on a feature that is not accepted",
+                    path,
+                )
+    state: dict[str, int] = {}
+
+    def visit(node: str) -> None:
+        state[node] = 1
+        for target in adjacency[node]:
+            if state.get(target) == 1:
+                report.error("feature-dependency-cycle", "cross-repository dependency graph contains a cycle", graph[node][1])
+            elif state.get(target, 0) == 0:
+                visit(target)
+        state[node] = 2
+
+    for reference in adjacency:
+        if state.get(reference, 0) == 0:
+            visit(reference)
+    return graph
 
 
 def _github_verify(
@@ -1362,123 +1238,48 @@ def _github_verify(
     repository = plan.get("repository")
     if not isinstance(repository, str):
         return
-    versioned_profiles = {"semver", "component-semver"}
-    if plan.get("profile") not in versioned_profiles:
-        if tag:
-            report.error(
-                "tag-profile",
-                "non-versioned release profiles reject product-version tags",
-                "plan",
-            )
-        return
-
-    ready_releases: list[tuple[str | None, Mapping[str, Any], str]] = []
-    for unit_id, unit, unit_path in _units(plan):
-        release = unit.get("nextRelease")
-        if isinstance(release, Mapping) and release.get("status") == "ready":
-            ready_releases.append((unit_id, release, f"{unit_path}.nextRelease"))
-
-    if tag:
-        matches = [
-            (unit_id, release, path)
-            for unit_id, release, path in ready_releases
-            if tag
-            == _release_tag(
-                plan.get("profile"), unit_id, release.get("version")
-            )
-        ]
-        if len(matches) != 1:
-            report.error(
-                "tag-version",
-                "tag must identify exactly one ready release using its profile convention",
-                "plan",
-            )
-        else:
-            encoded = urllib.parse.quote(tag, safe="")
-            try:
-                gh.json(["api", f"repos/{repository}/git/ref/tags/{encoded}"])
-            except GovernanceError as exc:
-                report.error(exc.code, exc.message, "plan")
-
-    if not ready_releases:
-        return
-    issue_expectations: dict[str, tuple[str, str]] = {}
-    milestones: set[str] = set()
-    for _, release, path in ready_releases:
-        expected_milestone = release.get("milestone")
-        if not isinstance(expected_milestone, str):
+    _validate_tag_locally(report, plan, tag) if tag else None
+    if tag and plan.get("profile") in {"semver", "component-semver"}:
+        encoded = urllib.parse.quote(tag, safe="")
+        try:
+            gh.json(["api", f"repos/{repository}/git/ref/tags/{encoded}"])
+        except GovernanceError as exc:
+            report.error(exc.code, exc.message, "plan")
+    graph = _remote_dependency_graph(report, plan, gh)
+    for reference, (feature, path, release) in graph.items():
+        if not reference.startswith(f"{repository}:"):
             continue
-        release_url = release.get("releaseIssue")
-        if isinstance(release_url, str):
-            issue_expectations[release_url] = (
-                expected_milestone,
-                f"{path}.releaseIssue",
-            )
-        scenarios = release.get("scenarios")
-        if isinstance(scenarios, list):
-            for index, scenario in enumerate(scenarios):
-                if isinstance(scenario, Mapping) and isinstance(scenario.get("issue"), str):
-                    issue_expectations[scenario["issue"]] = (
-                        expected_milestone,
-                        f"{path}.scenarios[{index}].issue",
-                    )
-        milestones.add(expected_milestone)
-
-    for url, (expected_milestone, issue_path) in sorted(
-        issue_expectations.items()
-    ):
-        number = _github_issue_number(url, repository)
+        pull_request = feature.get("pullRequest")
+        if not isinstance(pull_request, str):
+            continue
+        number = _pull_number(pull_request, repository)
         if number is None:
             continue
         try:
-            issue = gh.json(["api", f"repos/{repository}/issues/{number}"])
+            data = gh.json(["api", f"repos/{repository}/pulls/{number}"])
         except GovernanceError as exc:
-            report.error(exc.code, exc.message, "plan")
+            report.error(exc.code, exc.message, path)
             continue
-        if not isinstance(issue, Mapping) or issue.get("pull_request") is not None:
-            report.error("github-issue", "linked item is not an owning issue", issue_path)
+        if not isinstance(data, Mapping):
+            report.error("github-pull-request", "pull request response is invalid", path)
             continue
-        if issue.get("state") != "closed":
-            report.error(
-                "github-issue-open", "ready-release issue is not closed", issue_path
-            )
-        issue_milestone = issue.get("milestone")
-        actual_milestone = (
-            issue_milestone.get("title")
-            if isinstance(issue_milestone, Mapping)
-            else None
-        )
-        if actual_milestone != expected_milestone:
-            report.error(
-                "github-issue-milestone",
-                "ready-release issue is not bound to its declared milestone",
-                issue_path,
-            )
-
-    try:
-        milestone_data = gh.json(
-            ["api", f"repos/{repository}/milestones?state=all&per_page=100"]
-        )
-    except GovernanceError as exc:
-        report.error(exc.code, exc.message, "plan")
-        milestone_data = []
-    for title in milestones:
-        milestone = next(
-            (
-                item
-                for item in milestone_data
-                if isinstance(item, Mapping) and item.get("title") == title
-            ),
-            None,
-        )
-        if milestone is None:
-            report.error("github-milestone", "required milestone was not found", "plan")
-        elif milestone.get("state") != "closed" or milestone.get("open_issues", 0) != 0:
-            report.error(
-                "github-milestone-open",
-                "ready-release milestone must be closed with no open issues",
-                "plan",
-            )
+        status = feature.get("status")
+        if status in {"active", "blocked"} and data.get("state") != "open":
+            report.error("github-pull-request-closed", "in-progress feature pull request must be open", path)
+        if status == "accepted":
+            if not data.get("merged_at"):
+                report.error("github-pull-request-unmerged", "accepted feature pull request must be merged", path)
+            base = data.get("base")
+            base_ref = base.get("ref") if isinstance(base, Mapping) else None
+            expected_base = release.get("integrationBranch")
+            if base_ref != expected_base:
+                report.error(
+                    "github-pull-request-base",
+                    "accepted feature pull request must target the release integrationBranch",
+                    path,
+                )
+        if release.get("status") == "ready" and status != "accepted":
+            report.error("ready-feature-status", "ready release contains an unaccepted feature", path)
 
 
 def verify_repository(
@@ -1493,285 +1294,88 @@ def verify_repository(
     root = Path(repository_root)
     plan, _ = load_plan(root, plan_path)
     report = verify_plan(root, plan)
-    _check_expected_repository(
-        report,
-        plan,
-        expected_repository,
-        required=github or bool(tag),
-    )
-    if tag and not github:
-        _validate_tag_locally(report, plan, tag)
+    _check_expected_repository(report, plan, expected_repository, required=github or bool(tag))
     identity_ok = not any(
-        finding.code in {"expected-repository-required", "repository-mismatch"}
-        for finding in report.errors
+        item.code in {"expected-repository-required", "repository-mismatch"} for item in report.errors
     )
-    if github and gh is not None and getattr(gh, "apply", None) is not False:
-        report.error(
-            "github-apply-mismatch",
-            "GitHub verification requires a read-only client",
-            "plan",
-        )
-        identity_ok = False
-    if github and identity_ok:
-        _github_verify(
-            report,
-            plan,
-            gh or GhClient(apply=False),
-            tag=tag,
-        )
+    if github and gh is not None and gh.apply:
+        report.error("github-apply-mismatch", "GitHub verification requires a read-only client", "plan")
+    elif github and identity_ok:
+        _github_verify(report, plan, gh or GhClient(apply=False), tag=tag)
+    elif tag and identity_ok:
+        _validate_tag_locally(report, plan, tag)
     return report
 
 
-def _validate_tag_locally(
-    report: VerificationReport, plan: Mapping[str, Any], tag: str
-) -> None:
-    if plan.get("profile") not in {"semver", "component-semver"}:
-        report.error(
-            "tag-profile",
-            "non-versioned release profiles reject product-version tags",
-            "plan",
-        )
-        return
-    matches = 0
-    for unit_id, unit, _ in _units(plan):
-        release = unit.get("nextRelease")
-        if (
-            isinstance(release, Mapping)
-            and release.get("status") == "ready"
-            and tag
-            == _release_tag(
-                plan.get("profile"), unit_id, release.get("version")
-            )
-        ):
-            matches += 1
-    if matches != 1:
-        report.error(
-            "tag-version",
-            "tag must identify exactly one ready release using its profile convention",
-            "plan",
-        )
-
-
-def _find_project(
-    gh: GhClient, owner: str, title: str
-) -> Mapping[str, Any] | None:
-    data = gh.json(
-        [
-            "project",
-            "list",
-            "--owner",
-            owner,
-            "--limit",
-            "100",
-            "--format",
-            "json",
-        ]
-    )
-    projects = data.get("projects", []) if isinstance(data, Mapping) else data
-    if not isinstance(projects, list):
-        raise GovernanceError(
-            "github-response", "GitHub project list has an invalid shape"
-        )
-    matches = [
-        project
-        for project in projects
-        if isinstance(project, Mapping) and project.get("title") == title
-    ]
-    if len(matches) > 1:
-        raise GovernanceError(
-            "github-project-duplicate",
-            "more than one project uses the required title",
-        )
-    return matches[0] if matches else None
-
-
-def _project_item_urls(data: Any) -> set[str]:
-    items = data.get("items", []) if isinstance(data, Mapping) else data
-    if not isinstance(items, list):
-        return set()
-    result: set[str] = set()
-    for item in items:
-        if not isinstance(item, Mapping):
-            continue
-        content = item.get("content")
-        if isinstance(content, Mapping) and isinstance(content.get("url"), str):
-            result.add(content["url"])
-    return result
-
-
-def _project_items_by_url(data: Any) -> dict[str, Mapping[str, Any]]:
-    items = data.get("items", []) if isinstance(data, Mapping) else data
-    if not isinstance(items, list):
-        raise GovernanceError(
-            "github-response", "project item list has an invalid shape"
-        )
-    result: dict[str, Mapping[str, Any]] = {}
-    for item in items:
-        if not isinstance(item, Mapping):
-            raise GovernanceError(
-                "github-response", "project item list has an invalid shape"
-            )
-        content = item.get("content")
-        if isinstance(content, Mapping) and isinstance(content.get("url"), str):
-            url = content["url"]
-            if not isinstance(item.get("id"), str):
-                raise GovernanceError(
-                    "github-response", "project issue item has an invalid shape"
-                )
-            if url in result:
-                raise GovernanceError(
-                    "github-project-item-duplicate",
-                    "project contains a duplicate issue item",
-                )
-            result[url] = item
-    return result
-
-
 FIELD_SPECS: tuple[tuple[str, str, tuple[str, ...]], ...] = (
-    ("Target Version", "TEXT", ()),
     (
-        "Release Class",
+        "Status",
         "SINGLE_SELECT",
-        ("initial", "stabilization", "major", "minor", "patch"),
+        ("Planned", "Ready", "In progress", "Blocked", "In review", "Awaiting acceptance", "Accepted"),
     ),
-    ("Scenario Type", "SINGLE_SELECT", ("release", "capability", "breaking", "fix")),
+    ("Item type", "SINGLE_SELECT", ("Release", "Feature")),
+    ("Feature ID", "TEXT", ()),
+    ("Owner repository", "TEXT", ()),
+    ("Feature type", "SINGLE_SELECT", ("Capability", "Breaking", "Fix")),
+    ("Target version", "TEXT", ()),
+    (
+        "Release class",
+        "SINGLE_SELECT",
+        ("Patch", "Minor", "Major", "Initial"),
+    ),
+    (
+        "Risk",
+        "SINGLE_SELECT",
+        ("Low", "Medium", "High"),
+    ),
+    ("Depends on", "TEXT", ()),
+    ("Dependency state", "SINGLE_SELECT", ("Clear", "Blocked", "Unresolved", "Cycle")),
+    ("PR stage", "SINGLE_SELECT", ("None", "Draft", "Review", "Merged", "Closed")),
     (
         "Readiness",
         "SINGLE_SELECT",
-        ("planned", "active", "blocked", "accepted", "ready", "released"),
+        (
+            "Blocked",
+            "Ready to start",
+            "Developing",
+            "Ready for review",
+            "Waiting for gates",
+            "Ready to merge",
+            "Awaiting acceptance",
+            "Accepted",
+        ),
     ),
-    ("Target Date", "DATE", ()),
-    ("Risk", "SINGLE_SELECT", ("low", "medium", "high")),
+    ("Gate progress", "NUMBER", ()),
     ("Evidence", "TEXT", ()),
-    ("Release Unit", "TEXT", ()),
+    ("Release unit", "TEXT", ()),
+    ("Plan revision", "TEXT", ()),
+    ("Sync state", "SINGLE_SELECT", ("Current", "Stale", "Orphan", "Conflict")),
 )
 
 
-def bootstrap_project(
-    owner: str,
-    title: str = DEFAULT_PROJECT_TITLE,
-    *,
-    apply: bool = False,
-    gh: GhClient | None = None,
-) -> list[str]:
-    """Idempotently create the private organization release portfolio."""
-
-    _require_gh_apply_mode(gh, apply)
-    client = gh or GhClient(apply=apply)
-    project = _find_project(client, owner, title)
-    if project is None:
-        created = client.mutate_json(
-            "project.create",
-            [
-                "project",
-                "create",
-                "--owner",
-                owner,
-                "--title",
-                title,
-                "--format",
-                "json",
-            ],
-        )
-        if not apply:
-            for name, data_type, options in FIELD_SPECS:
-                _record_field_creation(client, owner, "pending", name, data_type, options)
-            return client.operations
-        if not isinstance(created, Mapping):
-            raise GovernanceError(
-                "github-response", "created project response has an invalid shape"
-            )
-        project = created
-
-    project_id = project.get("id")
-    project_number = project.get("number")
-    if project.get("public") is True:
-        if not isinstance(project_id, str):
-            raise GovernanceError(
-                "github-response", "project visibility cannot be safely updated"
-            )
-        client.mutate_json(
-            "project.make-private",
-            [
-                "api",
-                "graphql",
-                "-f",
-                (
-                    "query=mutation($projectId:ID!){"
-                    "updateProjectV2(input:{projectId:$projectId,public:false})"
-                    "{projectV2{id}}}"
-                ),
-                "-F",
-                f"projectId={project_id}",
-            ],
-        )
-    if not isinstance(project_number, int):
-        raise GovernanceError("github-response", "project has no usable number")
-    field_data = client.json(
-        [
-            "project",
-            "field-list",
-            str(project_number),
-            "--owner",
-            owner,
-            "--limit",
-            "100",
-            "--format",
-            "json",
-        ]
-    )
-    fields = field_data.get("fields", []) if isinstance(field_data, Mapping) else field_data
-    if not isinstance(fields, list):
-        raise GovernanceError("github-response", "project field list has an invalid shape")
-    by_name = {
-        field.get("name"): field
-        for field in fields
-        if isinstance(field, Mapping) and isinstance(field.get("name"), str)
-    }
-    for name, data_type, options in FIELD_SPECS:
-        existing = by_name.get(name)
-        if existing is None:
-            _record_field_creation(
-                client, owner, str(project_number), name, data_type, options
-            )
-            continue
-        actual_type = _field_data_type(existing)
-        if actual_type and actual_type != data_type:
-            raise GovernanceError(
-                "github-project-field",
-                f"project field '{name}' has an incompatible type",
-            )
-        if data_type == "SINGLE_SELECT":
-            actual_options = {
-                item.get("name")
-                for item in existing.get("options", [])
-                if isinstance(item, Mapping)
-            }
-            missing = set(options).difference(actual_options)
-            if missing:
-                raise GovernanceError(
-                    "github-project-field",
-                    f"project field '{name}' is missing required options",
-                )
-    return client.operations
+def _find_project(gh: GhClient, owner: str, title: str) -> Mapping[str, Any] | None:
+    data = gh.json(["project", "list", "--owner", owner, "--limit", "100", "--format", "json"])
+    projects = data.get("projects", []) if isinstance(data, Mapping) else data
+    if not isinstance(projects, list):
+        raise GovernanceError("github-response", "GitHub project list has invalid shape")
+    matches = [item for item in projects if isinstance(item, Mapping) and item.get("title") == title]
+    if len(matches) > 1:
+        raise GovernanceError("github-project-duplicate", "more than one project uses required title")
+    return matches[0] if matches else None
 
 
-def _field_data_type(field: Mapping[str, Any]) -> str | None:
-    data_type = field.get("dataType")
-    if isinstance(data_type, str):
-        return data_type.upper()
-    field_type = field.get("type")
-    if field_type == "ProjectV2SingleSelectField":
-        return "SINGLE_SELECT"
-    if field_type == "ProjectV2IterationField":
-        return "ITERATION"
+def _field_type(field: Mapping[str, Any]) -> str | None:
+    for key in ("dataType", "type"):
+        value = field.get(key)
+        if isinstance(value, str):
+            return value.upper()
     return None
 
 
 def _record_field_creation(
-    client: GhClient,
+    gh: GhClient,
     owner: str,
-    project_number: str,
+    number: str,
     name: str,
     data_type: str,
     options: Sequence[str],
@@ -1779,7 +1383,7 @@ def _record_field_creation(
     arguments = [
         "project",
         "field-create",
-        project_number,
+        number,
         "--owner",
         owner,
         "--name",
@@ -1791,515 +1395,157 @@ def _record_field_creation(
     ]
     if options:
         arguments.extend(["--single-select-options", ",".join(options)])
-    client.mutate_json(f"project.field.create:{name}", arguments)
+    gh.mutate_json(f"project.field.create:{name}", arguments)
 
 
-LABEL_SPECS: Mapping[str, tuple[str, str]] = {
-    "type:release": ("5319e7", "Repository release coordination issue"),
-    "type:scenario": ("1d76db", "Independently acceptable release scenario"),
-    "type:fix": ("d73a4a", "Backward-compatible defect correction"),
-    "type:capability": ("0e8a16", "New independently acceptable capability"),
-    "type:breaking": ("b60205", "Breaking behavior or migration"),
-    "semver:initial": ("8250df", "Initial 0.1.0 release"),
-    "semver:stabilization": ("8250df", "Controlled stability transition"),
-    "semver:major": ("b60205", "Major release impact"),
-    "semver:minor": ("1d76db", "Minor release impact"),
-    "semver:patch": ("d73a4a", "Patch release impact"),
-    "release:planned": ("c5def5", "Release is planned"),
-    "release:active": ("fbca04", "Release work is active"),
-    "release:blocked": ("b60205", "Release is blocked"),
-    "release:ready": ("0e8a16", "Release satisfies readiness policy"),
-    "scenario:planned": ("c5def5", "Scenario is planned"),
-    "scenario:active": ("fbca04", "Scenario work is active"),
-    "scenario:blocked": ("b60205", "Scenario is blocked"),
-    "scenario:accepted": ("0e8a16", "Scenario acceptance is complete"),
-}
-
-
-def _labels_from_json(data: Any) -> dict[str, Mapping[str, Any]]:
-    if not isinstance(data, list):
-        raise GovernanceError("github-response", "label list has an invalid shape")
-    result: dict[str, Mapping[str, Any]] = {}
-    for item in data:
-        if (
-            not isinstance(item, Mapping)
-            or not isinstance(item.get("name"), str)
-            or not isinstance(item.get("color"), str)
-            or (
-                item.get("description") is not None
-                and not isinstance(item.get("description"), str)
-            )
-        ):
-            raise GovernanceError(
-                "github-response", "label list has an invalid shape"
-            )
-        if item["name"] in result:
-            raise GovernanceError(
-                "github-label-duplicate", "GitHub label identity is ambiguous"
-            )
-        result[item["name"]] = item
-    return result
-
-
-def _ensure_labels(
-    client: GhClient,
-    repository: str,
-    existing: Mapping[str, Mapping[str, Any]],
-) -> None:
-    for name, (color, description) in LABEL_SPECS.items():
-        current = existing.get(name)
-        if current is None:
-            client.mutate_text(
-                f"label.create:{name}",
-                [
-                    "label",
-                    "create",
-                    name,
-                    "--repo",
-                    repository,
-                    "--color",
-                    color,
-                    "--description",
-                    description,
-                ],
-            )
-        elif (
-            str(current.get("color", "")).lower() != color
-            or current.get("description") != description
-        ):
-            client.mutate_text(
-                f"label.update:{name}",
-                [
-                    "label",
-                    "edit",
-                    name,
-                    "--repo",
-                    repository,
-                    "--color",
-                    color,
-                    "--description",
-                    description,
-                ],
-            )
-
-
-def _ensure_milestone(
-    client: GhClient,
-    repository: str,
-    release: Mapping[str, Any],
-    plan_reference: str,
-    existing: Mapping[str, Any] | None,
-) -> Mapping[str, Any] | None:
-    title = str(release.get("milestone"))
-    description = f"Release authority: {plan_reference}"
-    due_date = release.get("targetDate")
-    due_on = f"{due_date}T23:59:59Z" if isinstance(due_date, str) else None
-    if existing is None:
-        arguments = [
-            "api",
-            "-X",
-            "POST",
-            f"repos/{repository}/milestones",
-            "-f",
-            f"title={title}",
-            "-f",
-            f"description={description}",
-        ]
-        if due_on:
-            arguments.extend(["-f", f"due_on={due_on}"])
-        created = client.mutate_json("milestone.create", arguments)
-        return created if isinstance(created, Mapping) else None
-    changes = (
-        existing.get("description") != description
-        or (due_on is not None and existing.get("due_on") != due_on)
-    )
-    if changes:
-        number = existing.get("number")
-        if not isinstance(number, int):
-            raise GovernanceError("github-response", "milestone has no usable number")
-        arguments = [
-            "api",
-            "-X",
-            "PATCH",
-            f"repos/{repository}/milestones/{number}",
-            "-f",
-            f"description={description}",
-        ]
-        if due_on:
-            arguments.extend(["-f", f"due_on={due_on}"])
-        client.mutate_json("milestone.update", arguments)
-    return existing
-
-
-def _preflight_milestones(
-    data: Any,
-    active_units: Sequence[tuple[str | None, Mapping[str, Any], str]],
-) -> dict[str, Mapping[str, Any] | None]:
-    if not isinstance(data, list):
-        raise GovernanceError("github-response", "milestone list has an invalid shape")
-    expected_dates: dict[str, Any] = {}
-    for _, unit, _ in active_units:
-        release = unit.get("nextRelease")
-        if not isinstance(release, Mapping):
-            continue
-        title = release.get("milestone")
-        if not isinstance(title, str):
-            continue
-        target_date = release.get("targetDate")
-        if title in expected_dates and expected_dates[title] != target_date:
-            raise GovernanceError(
-                "github-milestone-conflict",
-                "one milestone cannot represent releases with different target dates",
-            )
-        expected_dates[title] = target_date
-
-    matches: dict[str, list[Mapping[str, Any]]] = {
-        title: [] for title in expected_dates
-    }
-    for item in data:
-        if not isinstance(item, Mapping) or not isinstance(item.get("title"), str):
-            raise GovernanceError(
-                "github-response", "milestone list has an invalid shape"
-            )
-        title = item["title"]
-        if title in matches:
-            if not isinstance(item.get("number"), int):
-                raise GovernanceError(
-                    "github-response", "milestone has no usable number"
-                )
-            matches[title].append(item)
-    result: dict[str, Mapping[str, Any] | None] = {}
-    for title, items in matches.items():
-        if len(items) > 1:
-            raise GovernanceError(
-                "github-milestone-duplicate",
-                "required milestone identity is ambiguous",
-            )
-        result[title] = items[0] if items else None
-    return result
-
-
-def _issue_marker(unit: str, kind: str, identity: str) -> str:
-    safe_identity = re.sub(r"[^A-Za-z0-9_.:-]", "-", identity)
-    return f"<!-- release-governance:{unit}:{kind}:{safe_identity} -->"
-
-
-def _release_issue_body(
-    release: Mapping[str, Any], marker: str, plan_reference: str
-) -> str:
-    scenarios = release.get("scenarios")
-    scenario_ids = (
-        ", ".join(
-            str(item.get("id"))
-            for item in scenarios
-            if isinstance(item, Mapping)
-        )
-        if isinstance(scenarios, list)
-        else ""
-    )
-    return (
-        f"{marker}\n\n"
-        f"Release authority: `{plan_reference}`\n\n"
-        f"- Version: `{release.get('version')}`\n"
-        f"- Classification: `{release.get('classification')}`\n"
-        f"- Scenarios: {scenario_ids or 'none'}\n"
-    )
-
-
-def _scenario_issue_body(
-    scenario: Mapping[str, Any],
-    release: Mapping[str, Any],
-    marker: str,
-    plan_reference: str,
-) -> str:
-    acceptance = scenario.get("acceptance")
-    acceptance_lines = (
-        "\n".join(f"- {item}" for item in acceptance)
-        if isinstance(acceptance, list)
-        else ""
-    )
-    evidence = scenario.get("evidence")
-    evidence_lines = (
-        "\n".join(f"- {item}" for item in evidence)
-        if isinstance(evidence, list) and evidence
-        else "- Pending"
-    )
-    return (
-        f"{marker}\n\n"
-        f"Release authority: `{plan_reference}`\n\n"
-        f"Target: `{release.get('milestone')}`  \n"
-        f"Scenario: `{scenario.get('id')}`  \n"
-        f"Type: `{scenario.get('type')}`  \n"
-        f"Risk: `{scenario.get('risk')}`\n\n"
-        f"## Acceptance\n\n{acceptance_lines}\n\n"
-        f"## Evidence\n\n{evidence_lines}\n"
-    )
-
-
-def _issue_labels(item: Mapping[str, Any]) -> set[str]:
-    labels = item.get("labels")
-    if not isinstance(labels, list):
-        return set()
-    result: set[str] = set()
-    for label in labels:
-        if isinstance(label, str):
-            result.add(label)
-        elif isinstance(label, Mapping) and isinstance(label.get("name"), str):
-            result.add(label["name"])
-    return result
-
-
-def _issue_milestone(item: Mapping[str, Any]) -> str | None:
-    milestone = item.get("milestone")
-    if isinstance(milestone, Mapping):
-        title = milestone.get("title")
-        return title if isinstance(title, str) else None
-    return milestone if isinstance(milestone, str) else None
-
-
-def _preflight_issue_list(
-    data: Any, repository: str
-) -> list[Mapping[str, Any]]:
-    if not isinstance(data, list):
-        raise GovernanceError("github-response", "issue list has an invalid shape")
-    result: list[Mapping[str, Any]] = []
-    seen_numbers: set[int] = set()
-    for item in data:
-        if not isinstance(item, Mapping):
-            raise GovernanceError("github-response", "issue list has an invalid shape")
-        number = item.get("number")
-        issue_reference = item.get("url")
-        milestone = item.get("milestone")
-        labels = item.get("labels")
-        if (
-            not isinstance(number, int)
-            or number in seen_numbers
-            or not isinstance(item.get("title"), str)
-            or not isinstance(item.get("body"), str)
-            or not isinstance(issue_reference, str)
-            or _github_issue_number(issue_reference, repository) != number
-            or not isinstance(item.get("state"), str)
-            or not isinstance(labels, list)
-            or any(
-                not (
-                    isinstance(label, str)
-                    or (
-                        isinstance(label, Mapping)
-                        and isinstance(label.get("name"), str)
-                    )
-                )
-                for label in labels
-            )
-            or not (
-                milestone is None
-                or isinstance(milestone, str)
-                or (
-                    isinstance(milestone, Mapping)
-                    and isinstance(milestone.get("title"), str)
-                )
-            )
-        ):
-            raise GovernanceError("github-response", "issue list has an invalid shape")
-        seen_numbers.add(number)
-        result.append(item)
-    return result
-
-
-def _preflight_issue(
-    repository: str,
-    issues: Sequence[Mapping[str, Any]],
+def bootstrap_project(
+    owner: str,
+    title: str = DEFAULT_PROJECT_TITLE,
     *,
-    configured_url: Any,
-    marker: str,
-    claimed_numbers: MutableMapping[int, str],
-) -> Mapping[str, Any] | None:
-    configured_number: int | None = None
-    if configured_url is not None:
-        configured_number = _github_issue_number(configured_url, repository)
-        if configured_number is None:
-            raise GovernanceError(
-                "github-issue",
-                "configured issue must belong to the release-plan repository",
-            )
-    existing: Mapping[str, Any] | None = None
-    if configured_number is not None:
-        existing = next(
-            (item for item in issues if item.get("number") == configured_number),
-            None,
+    apply: bool = False,
+    gh: GhClient | None = None,
+) -> list[str]:
+    _require_mode(gh, apply)
+    client = gh or GhClient(apply=apply)
+    project = _find_project(client, owner, title)
+    if project is None:
+        created = client.mutate_json(
+            "project.create",
+            ["project", "create", "--owner", owner, "--title", title, "--format", "json"],
         )
-        if existing is None:
-            raise GovernanceError(
-                "github-issue", "configured issue was not found in the owning repository"
-            )
-    else:
-        matches = [
-            item
-            for item in issues
-            if isinstance(item.get("body"), str) and marker in item["body"]
-        ]
-        if len(matches) > 1:
-            raise GovernanceError(
-                "github-issue-duplicate", "multiple managed issues use one governance marker"
-            )
-        existing = matches[0] if matches else None
-    if existing is None:
-        return None
-
-    number = existing.get("number")
-    body = existing.get("body")
-    if not isinstance(number, int) or not isinstance(body, str):
-        raise GovernanceError("github-response", "managed issue has an invalid shape")
-    managed_markers = re.findall(r"<!-- release-governance:[^>]+ -->", body)
-    if managed_markers and marker not in managed_markers:
-        raise GovernanceError(
-            "github-issue-marker",
-            "configured issue belongs to a different managed release item",
-        )
-    previous_marker = claimed_numbers.get(number)
-    if previous_marker is not None and previous_marker != marker:
-        raise GovernanceError(
-            "github-issue-duplicate",
-            "one GitHub issue cannot represent multiple release items",
-        )
-    claimed_numbers[number] = marker
-    return existing
-
-
-def _ensure_issue(
-    client: GhClient,
-    repository: str,
-    *,
-    configured_url: Any,
-    marker: str,
-    title: str,
-    body: str,
-    labels: Sequence[str],
-    milestone: str,
-    existing: Mapping[str, Any] | None,
-) -> str | None:
-    if existing is None:
-        output = client.mutate_text(
-            "issue.create",
+        if not apply:
+            for name, data_type, options in FIELD_SPECS:
+                _record_field_creation(client, owner, "pending", name, data_type, options)
+            return client.operations
+        if not isinstance(created, Mapping):
+            raise GovernanceError("github-response", "created project response is invalid")
+        project = created
+    project_id = project.get("id")
+    number = project.get("number")
+    if project.get("public") is True:
+        if not isinstance(project_id, str):
+            raise GovernanceError("github-response", "project identity is incomplete")
+        client.mutate_json(
+            "project.make-private",
             [
-                "issue",
-                "create",
-                "--repo",
-                repository,
-                "--title",
-                title,
-                "--body",
-                body,
-                "--label",
-                ",".join(labels),
-                "--milestone",
-                milestone,
+                "api",
+                "graphql",
+                "-f",
+                (
+                    "query=mutation($projectId:ID!){"
+                    "updateProjectV2(input:{projectId:$projectId,public:false}){projectV2{id}}}"
+                ),
+                "-F",
+                f"projectId={project_id}",
             ],
         )
-        return output.strip() if isinstance(output, str) else None
-
-    current_url = existing.get("url")
-    issue_ref = (
-        str(existing.get("number"))
-        if isinstance(existing.get("number"), int)
-        else str(current_url)
+    if not isinstance(number, int):
+        raise GovernanceError("github-response", "project number is unavailable")
+    data = client.json(
+        ["project", "field-list", str(number), "--owner", owner, "--limit", "100", "--format", "json"]
     )
-    managed = isinstance(existing.get("body"), str) and marker in existing["body"]
-    required_labels = set(labels)
-    arguments = ["issue", "edit", issue_ref, "--repo", repository]
-    changed = False
-    if managed and existing.get("title") != title:
-        arguments.extend(["--title", title])
-        changed = True
-    if managed and existing.get("body") != body:
-        arguments.extend(["--body", body])
-        changed = True
-    missing_labels = sorted(required_labels.difference(_issue_labels(existing)))
-    if missing_labels:
-        arguments.extend(["--add-label", ",".join(missing_labels)])
-        changed = True
-    if _issue_milestone(existing) != milestone:
-        arguments.extend(["--milestone", milestone])
-        changed = True
-    if changed:
-        client.mutate_text("issue.update", arguments)
-    return current_url if isinstance(current_url, str) else (
-        configured_url if isinstance(configured_url, str) else None
-    )
-
-
-def _field_map(data: Any) -> dict[str, Mapping[str, Any]]:
     fields = data.get("fields", []) if isinstance(data, Mapping) else data
     if not isinstance(fields, list):
-        raise GovernanceError(
-            "github-response", "project field list has an invalid shape"
-        )
+        raise GovernanceError("github-response", "project field list has invalid shape")
+    by_name = {
+        item.get("name"): item
+        for item in fields
+        if isinstance(item, Mapping) and isinstance(item.get("name"), str)
+    }
+    for name, data_type, options in FIELD_SPECS:
+        existing = by_name.get(name)
+        if existing is None:
+            _record_field_creation(client, owner, str(number), name, data_type, options)
+            continue
+        actual = _field_type(existing)
+        if actual is not None and actual != data_type:
+            raise GovernanceError("github-project-field", f"project field '{name}' has incompatible type")
+        if options:
+            actual_options = {
+                item.get("name")
+                for item in existing.get("options", [])
+                if isinstance(item, Mapping)
+            }
+            if set(options).difference(actual_options):
+                raise GovernanceError("github-project-field", f"project field '{name}' lacks required options")
+    return client.operations
+
+
+def _project_fields(data: Any) -> dict[str, Mapping[str, Any]]:
+    fields = data.get("fields", []) if isinstance(data, Mapping) else data
+    if not isinstance(fields, list):
+        raise GovernanceError("github-response", "project field list has invalid shape")
     result: dict[str, Mapping[str, Any]] = {}
     for field in fields:
         if not isinstance(field, Mapping) or not isinstance(field.get("name"), str):
-            raise GovernanceError(
-                "github-response", "project field list has an invalid shape"
-            )
+            raise GovernanceError("github-response", "project field list has invalid shape")
         if field["name"] in result:
-            raise GovernanceError(
-                "github-project-field",
-                "project field identity is ambiguous",
-            )
+            raise GovernanceError("github-project-field", "project field identity is ambiguous")
         result[field["name"]] = field
+    for name, data_type, options in FIELD_SPECS:
+        field = result.get(name)
+        if field is None or not isinstance(field.get("id"), str):
+            raise GovernanceError("github-project-field", f"project is missing required field '{name}'")
+        actual = _field_type(field)
+        if actual is not None and actual != data_type:
+            raise GovernanceError("github-project-field", f"project field '{name}' has incompatible type")
+        if options:
+            names = {
+                option.get("name")
+                for option in field.get("options", [])
+                if isinstance(option, Mapping)
+            }
+            if set(options).difference(names):
+                raise GovernanceError("github-project-field", f"project field '{name}' lacks required options")
     return result
 
 
-def _validate_required_project_fields(
-    fields: Mapping[str, Mapping[str, Any]],
-) -> None:
-    for name, data_type, options in FIELD_SPECS:
-        field = fields.get(name)
-        if field is None or not isinstance(field.get("id"), str):
-            raise GovernanceError(
-                "github-project-field",
-                f"release portfolio is missing required field '{name}'",
-            )
-        actual_type = _field_data_type(field)
-        if actual_type is not None and actual_type != data_type:
-            raise GovernanceError(
-                "github-project-field",
-                f"project field '{name}' has an incompatible type",
-            )
-        if data_type == "SINGLE_SELECT":
-            for option in options:
-                if _select_option_id(field, option) is None:
-                    raise GovernanceError(
-                        "github-project-field",
-                        f"project field '{name}' is missing required options",
-                    )
+def _project_items(
+    data: Any,
+) -> tuple[dict[str, Mapping[str, Any]], dict[str, Mapping[str, Any]]]:
+    items = data.get("items", []) if isinstance(data, Mapping) else data
+    if not isinstance(items, list):
+        raise GovernanceError("github-response", "project item list has invalid shape")
+    by_url: dict[str, Mapping[str, Any]] = {}
+    by_marker: dict[str, Mapping[str, Any]] = {}
+    for item in items:
+        if not isinstance(item, Mapping) or not isinstance(item.get("id"), str):
+            raise GovernanceError("github-response", "project item has invalid shape")
+        content = item.get("content")
+        if not isinstance(content, Mapping):
+            continue
+        url = content.get("url")
+        if isinstance(url, str):
+            if url in by_url:
+                raise GovernanceError("github-project-item-duplicate", "project contains duplicate URL item")
+            by_url[url] = item
+        body = content.get("body")
+        if isinstance(body, str):
+            for marker in re.findall(r"<!-- release-plan:[^>]+ -->", body):
+                if marker in by_marker:
+                    raise GovernanceError("github-project-item-duplicate", "project contains duplicate plan marker")
+                by_marker[marker] = item
+    return by_url, by_marker
 
 
-def _select_option_id(field: Mapping[str, Any], name: str) -> str | None:
-    options = field.get("options")
-    if not isinstance(options, list):
-        return None
-    for option in options:
-        if (
-            isinstance(option, Mapping)
-            and option.get("name") == name
-            and isinstance(option.get("id"), str)
-        ):
+def _option_id(field: Mapping[str, Any], value: str) -> str | None:
+    for option in field.get("options", []):
+        if isinstance(option, Mapping) and option.get("name") == value and isinstance(option.get("id"), str):
             return option["id"]
     return None
 
 
 def _set_project_fields(
-    client: GhClient,
+    gh: GhClient,
     project_id: str,
     item_id: str,
     fields: Mapping[str, Mapping[str, Any]],
-    values: Mapping[str, str | None],
+    values: Mapping[str, str | int | None],
 ) -> None:
-    for field_name, value in values.items():
+    for name, value in values.items():
         if value is None:
             continue
-        field = fields.get(field_name)
-        if not isinstance(field, Mapping) or not isinstance(field.get("id"), str):
-            continue
+        field = fields[name]
         arguments = [
             "project",
             "item-edit",
@@ -2308,69 +1554,216 @@ def _set_project_fields(
             "--project-id",
             project_id,
             "--field-id",
-            field["id"],
+            str(field["id"]),
         ]
-        data_type = _field_data_type(field)
+        data_type = _field_type(field)
         if data_type == "SINGLE_SELECT":
-            option_id = _select_option_id(field, value)
-            if option_id is None:
-                continue
-            arguments.extend(["--single-select-option-id", option_id])
+            option = _option_id(field, str(value))
+            if option is None:
+                raise GovernanceError("github-project-field", f"field '{name}' lacks value '{value}'")
+            arguments.extend(["--single-select-option-id", option])
         elif data_type == "DATE":
-            arguments.extend(["--date", value])
+            arguments.extend(["--date", str(value)])
+        elif data_type == "NUMBER":
+            arguments.extend(["--number", str(value)])
         else:
-            arguments.extend(["--text", value])
-        client.mutate_text(f"project.field.set:{field_name}", arguments)
+            arguments.extend(["--text", str(value)])
+        gh.mutate_text(f"project.field.set:{name}", arguments)
 
 
-def _add_project_issue(
-    client: GhClient,
+def _draft_marker(repository: str, kind: str, identity: str) -> str:
+    return f"<!-- release-plan:{repository}:{kind}:{identity} -->"
+
+
+def _ensure_draft(
+    gh: GhClient,
     *,
     owner: str,
-    project: Mapping[str, Any],
-    project_items: MutableMapping[str, Mapping[str, Any]],
-    fields: Mapping[str, Mapping[str, Any]],
-    url: str | None,
-    values: Mapping[str, str | None],
-) -> None:
-    if url is None:
-        if not client.apply:
-            client.operations.append("project.item.add")
-        return
-    project_number = project.get("number")
-    project_id = project.get("id")
-    if not isinstance(project_number, int) or not isinstance(project_id, str):
-        raise GovernanceError("github-response", "project identity is incomplete")
-    existing = project_items.get(url)
-    if existing is None:
-        created = client.mutate_json(
-            "project.item.add",
+    number: int,
+    title: str,
+    body: str,
+    marker: str,
+    existing: Mapping[str, Any] | None,
+) -> Mapping[str, Any] | None:
+    if existing is not None:
+        return existing
+    created = gh.mutate_json(
+        "project.draft.create",
+        [
+            "project",
+            "item-create",
+            str(number),
+            "--owner",
+            owner,
+            "--title",
+            title,
+            "--body",
+            f"{marker}\n\n{body}",
+            "--format",
+            "json",
+        ],
+    )
+    return created if isinstance(created, Mapping) else None
+
+
+def _ensure_url_item(
+    gh: GhClient,
+    *,
+    owner: str,
+    number: int,
+    url: str,
+    existing: Mapping[str, Any] | None,
+) -> Mapping[str, Any] | None:
+    if existing is not None:
+        return existing
+    created = gh.mutate_json(
+        "project.item.add",
+        [
+            "project",
+            "item-add",
+            str(number),
+            "--owner",
+            owner,
+            "--url",
+            url,
+            "--format",
+            "json",
+        ],
+    )
+    return created if isinstance(created, Mapping) else None
+
+
+def _archive_item(gh: GhClient, owner: str, number: int, item: Mapping[str, Any]) -> None:
+    item_id = item.get("id")
+    if isinstance(item_id, str):
+        gh.mutate_json(
+            "project.item.archive",
             [
                 "project",
-                "item-add",
-                str(project_number),
+                "item-archive",
+                str(number),
                 "--owner",
                 owner,
-                "--url",
-                url,
+                "--id",
+                item_id,
                 "--format",
                 "json",
             ],
         )
-        if not client.apply:
-            return
-        if not isinstance(created, Mapping):
-            raise GovernanceError(
-                "github-response", "created project item response has an invalid shape"
-            )
-        existing = created
-        project_items[url] = existing
-    item_id = existing.get("id")
-    if isinstance(item_id, str):
-        _set_project_fields(client, project_id, item_id, fields, values)
 
 
-def sync_github(
+def _release_unit_name(repository: str, unit_id: str | None) -> str:
+    return unit_id or repository.split("/", 1)[1]
+
+
+def _plan_revision(plan: Mapping[str, Any]) -> str:
+    canonical = json.dumps(plan, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _project_release_class(value: Any) -> str | None:
+    mapping = {
+        "patch": "Patch",
+        "minor": "Minor",
+        "major": "Major",
+        "initial": "Initial",
+    }
+    return mapping.get(value)
+
+
+def _project_risk(value: Any) -> str | None:
+    return {"low": "Low", "medium": "Medium", "high": "High"}.get(value)
+
+
+def _project_feature_type(value: Any) -> str | None:
+    return {
+        "capability": "Capability",
+        "breaking": "Breaking",
+        "fix": "Fix",
+    }.get(value)
+
+
+def _project_release_status(value: Any) -> str:
+    return {
+        "planned": "Planned",
+        "active": "In progress",
+        "blocked": "Blocked",
+        "ready": "Ready",
+    }.get(value, "Planned")
+
+
+def _project_feature_status(value: Any, pr_stage: str) -> str:
+    if value == "blocked":
+        return "Blocked"
+    if value == "accepted":
+        return "Accepted"
+    if pr_stage == "Merged":
+        return "Awaiting acceptance"
+    if pr_stage == "Review":
+        return "In review"
+    if value == "active":
+        return "In progress"
+    return "Planned"
+
+
+def _project_readiness(status: Any, pr_stage: str, dependency_state: str) -> str:
+    if status == "accepted":
+        return "Accepted"
+    if status == "blocked" or dependency_state in {"Blocked", "Unresolved", "Cycle"}:
+        return "Blocked"
+    if pr_stage == "None":
+        return "Ready to start"
+    if pr_stage == "Draft":
+        return "Developing"
+    if pr_stage == "Review":
+        return "Ready for review"
+    if pr_stage == "Merged":
+        return "Awaiting acceptance"
+    return "Blocked"
+
+
+def _gate_progress(status: Any, pr_stage: str, dependency_state: str) -> int:
+    if status == "accepted":
+        return 100
+    if dependency_state in {"Blocked", "Unresolved", "Cycle"}:
+        return 0
+    return {
+        "None": 0,
+        "Draft": 25,
+        "Review": 50,
+        "Merged": 75,
+        "Closed": 0,
+    }[pr_stage]
+
+
+def _dependency_projection(
+    feature: Mapping[str, Any],
+    graph: Mapping[str, tuple[Mapping[str, Any], str, Mapping[str, Any]]],
+    dependency_report: VerificationReport,
+) -> str:
+    dependencies = feature.get("dependsOn")
+    if not isinstance(dependencies, list) or not dependencies:
+        return "Clear"
+    if any(item.code == "feature-dependency-cycle" for item in dependency_report.errors):
+        return "Cycle"
+    if any(dependency not in graph for dependency in dependencies):
+        return "Unresolved"
+    if any(graph[dependency][0].get("status") != "accepted" for dependency in dependencies):
+        return "Blocked"
+    return "Clear"
+
+
+def _pull_stage(data: Any) -> str:
+    if not isinstance(data, Mapping):
+        return "Closed"
+    if data.get("merged_at"):
+        return "Merged"
+    if data.get("state") != "open":
+        return "Closed"
+    return "Draft" if data.get("draft") is True else "Review"
+
+
+def sync_project(
     repository_root: Path | str,
     plan: Mapping[str, Any],
     *,
@@ -2378,367 +1771,254 @@ def sync_github(
     project_title: str = DEFAULT_PROJECT_TITLE,
     apply: bool = False,
     gh: GhClient | None = None,
-    plan_reference: str = DEFAULT_PLAN_PATH,
     expected_repository: str | None = None,
 ) -> list[str]:
-    """Idempotently synchronize release labels, milestones, issues, and Project."""
+    """Idempotently project releases and feature PRs without changing authority."""
 
-    root = Path(repository_root)
     _require_expected_repository(plan, expected_repository)
-    _require_gh_apply_mode(gh, apply)
+    _require_mode(gh, apply)
+    root = Path(repository_root)
     report = verify_plan(root, plan)
-    structural_errors = [
-        finding
-        for finding in report.errors
-        if finding.code
-        not in {
-            "document-missing",
-            "document-drift",
-            "version-source-drift",
-            "changelog-version",
-            "ready-release-issue",
-            "ready-scenario-issue",
-        }
+    structural = [
+        item
+        for item in report.errors
+        if item.code not in {"document-missing", "document-drift", "version-source-drift", "changelog-version"}
     ]
-    if structural_errors:
-        raise GovernanceError(
-            "plan-invalid", "release plan must pass structural policy before synchronization"
-        )
-    repository = plan.get("repository")
-    if not isinstance(repository, str):
-        raise GovernanceError("plan-invalid", "release plan repository is invalid")
+    if structural:
+        raise GovernanceError("plan-invalid", "release plan must pass structural policy before projection")
+    repository = str(plan["repository"])
     client = gh or GhClient(apply=apply)
-    active_units = [
-        (unit_id, unit, unit_path)
-        for unit_id, unit, unit_path in _units(plan)
-        if isinstance(unit.get("nextRelease"), Mapping)
-    ]
-    project: Mapping[str, Any] | None = None
-    project_items: dict[str, Mapping[str, Any]] = {}
-    fields: dict[str, Mapping[str, Any]] = {}
-    # This entire Project preflight intentionally happens before the first
-    # remote mutation.  A release sync is not allowed to leave labels or issues
-    # half-created when the required private portfolio cannot be maintained.
-    if active_units:
-        project = _find_project(client, project_owner, project_title)
-        if project is None:
-            raise GovernanceError(
-                "github-project", "required release portfolio was not found"
-            )
-        if project.get("public") is not False:
-            raise GovernanceError(
-                "github-project-privacy",
-                "release portfolio must be explicitly reported as private",
-            )
-        if (
-            not isinstance(project.get("number"), int)
-            or not isinstance(project.get("id"), str)
-        ):
-            raise GovernanceError(
-                "github-response", "release portfolio identity is incomplete"
-            )
-        item_data = client.json(
-            [
-                "project",
-                "item-list",
-                str(project["number"]),
-                "--owner",
-                project_owner,
-                "--limit",
-                "1000",
-                "--format",
-                "json",
-            ]
-        )
-        project_items = _project_items_by_url(item_data)
-        field_data = client.json(
-            [
-                "project",
-                "field-list",
-                str(project["number"]),
-                "--owner",
-                project_owner,
-                "--limit",
-                "100",
-                "--format",
-                "json",
-            ]
-        )
-        fields = _field_map(field_data)
-        _validate_required_project_fields(fields)
 
-    # Complete every remote read before the first mutation.  The mutation
-    # phase below consumes only these snapshots; an interrupted later write is
-    # recovered by the idempotent next run.
-    label_data = client.json(
+    # Finish every remote read before the first mutation.
+    project = _find_project(client, project_owner, project_title)
+    if project is None:
+        raise GovernanceError("github-project", "required release portfolio was not found")
+    if project.get("public") is not False:
+        raise GovernanceError("github-project-privacy", "release portfolio must be private")
+    project_id = project.get("id")
+    project_number = project.get("number")
+    if not isinstance(project_id, str) or not isinstance(project_number, int):
+        raise GovernanceError("github-response", "project identity is incomplete")
+    item_data = client.json(
         [
-            "label",
-            "list",
-            "--repo",
-            repository,
+            "project",
+            "item-list",
+            str(project_number),
+            "--owner",
+            project_owner,
             "--limit",
-            "200",
-            "--json",
-            "name,color,description",
+            "1000",
+            "--format",
+            "json",
         ]
     )
-    existing_labels = _labels_from_json(label_data)
-    raw_issue_data = client.json(
+    by_url, by_marker = _project_items(item_data)
+    field_data = client.json(
         [
-            "issue",
-            "list",
-            "--repo",
-            repository,
-            "--state",
-            "all",
+            "project",
+            "field-list",
+            str(project_number),
+            "--owner",
+            project_owner,
             "--limit",
-            "500",
-            "--json",
-            "number,title,body,url,state,milestone,labels",
+            "100",
+            "--format",
+            "json",
         ]
     )
-    issue_data = _preflight_issue_list(raw_issue_data, repository)
-    raw_milestone_data = client.json(
-        ["api", f"repos/{repository}/milestones?state=all&per_page=100"]
-    )
-    existing_milestones = _preflight_milestones(
-        raw_milestone_data, active_units
-    )
-    claimed_issue_numbers: dict[int, str] = {}
-    existing_issues: dict[str, Mapping[str, Any] | None] = {}
-    for unit_id, unit, _ in active_units:
+    fields = _project_fields(field_data)
+    dependency_report = VerificationReport()
+    dependency_graph = _remote_dependency_graph(dependency_report, plan, client)
+    pull_stages: dict[str, str] = {}
+    for _, feature, _, _, _ in _feature_entries(plan):
+        pull_request = feature.get("pullRequest")
+        if not isinstance(pull_request, str) or pull_request in pull_stages:
+            continue
+        number = _pull_number(pull_request, repository)
+        if number is None:
+            continue
+        try:
+            pull_data = client.json(["api", f"repos/{repository}/pulls/{number}"])
+        except GovernanceError:
+            pull_stages[pull_request] = "Closed"
+        else:
+            pull_stages[pull_request] = _pull_stage(pull_data)
+
+    revision = _plan_revision(plan)
+    desired_markers: set[str] = set()
+    for unit_id, unit, _ in _units(plan):
         release = unit.get("nextRelease")
         if not isinstance(release, Mapping):
             continue
-        unit_name = unit_id or repository.split("/", 1)[1]
-        marker = _issue_marker(unit_name, "release", str(release.get("version")))
-        existing_issues[marker] = _preflight_issue(
-            repository,
-            issue_data,
-            configured_url=release.get("releaseIssue"),
-            marker=marker,
-            claimed_numbers=claimed_issue_numbers,
-        )
-        scenarios = release.get("scenarios")
-        if not isinstance(scenarios, list):
-            continue
-        for scenario in scenarios:
-            if not isinstance(scenario, Mapping):
-                continue
-            scenario_marker = _issue_marker(
-                unit_name, "scenario", str(scenario.get("id"))
-            )
-            existing_issues[scenario_marker] = _preflight_issue(
-                repository,
-                issue_data,
-                configured_url=scenario.get("issue"),
-                marker=scenario_marker,
-                claimed_numbers=claimed_issue_numbers,
-            )
-
-    _ensure_labels(client, repository, existing_labels)
-    synchronized_milestones: set[str] = set()
-    for unit_id, unit, _ in active_units:
-        release = unit.get("nextRelease")
-        if not isinstance(release, Mapping):
-            continue
-        milestone_title = str(release.get("milestone"))
-        if milestone_title not in synchronized_milestones:
-            _ensure_milestone(
-                client,
-                repository,
-                release,
-                plan_reference,
-                existing_milestones.get(milestone_title),
-            )
-            synchronized_milestones.add(milestone_title)
-        unit_name = unit_id or repository.split("/", 1)[1]
-        marker = _issue_marker(unit_name, "release", str(release.get("version")))
-        classification = str(release.get("classification"))
-        release_status = str(release.get("status"))
-        release_url = _ensure_issue(
+        unit_name = _release_unit_name(repository, unit_id)
+        version = str(release.get("version"))
+        accepted, total, percent = _feature_progress(release)
+        release_marker = _draft_marker(repository, "release", f"{unit_name}:{version}")
+        desired_markers.add(release_marker)
+        release_item = _ensure_draft(
             client,
-            repository,
-            configured_url=release.get("releaseIssue"),
-            marker=marker,
-            title=f"[Release] {release.get('milestone')}",
-            body=_release_issue_body(release, marker, plan_reference),
-            labels=(
-                "type:release",
-                f"semver:{classification}",
-                f"release:{release_status}",
-            ),
-            milestone=str(release.get("milestone")),
-            existing=existing_issues[marker],
+            owner=project_owner,
+            number=project_number,
+            title=f"[{repository}] {unit_name} v{version}",
+            body=f"Release projection from `{DEFAULT_PLAN_PATH}`. {accepted}/{total} features accepted.",
+            marker=release_marker,
+            existing=by_marker.get(release_marker),
         )
-        if (
-            client.apply
-            and isinstance(release, MutableMapping)
-            and isinstance(release_url, str)
-        ):
-            release["releaseIssue"] = release_url
-        if project is not None:
-            _add_project_issue(
+        if isinstance(release_item, Mapping) and isinstance(release_item.get("id"), str):
+            _set_project_fields(
                 client,
-                owner=project_owner,
-                project=project,
-                project_items=project_items,
-                fields=fields,
-                url=release_url,
-                values={
-                    "Target Version": str(release.get("version")),
-                    "Release Class": classification,
-                    "Scenario Type": "release",
-                    "Readiness": release_status,
-                    "Target Date": release.get("targetDate"),
-                    "Risk": _highest_risk(release.get("scenarios")),
-                    "Evidence": _release_evidence(release.get("scenarios")),
-                    "Release Unit": unit_name,
+                project_id,
+                str(release_item["id"]),
+                fields,
+                {
+                    "Status": _project_release_status(release.get("status")),
+                    "Item type": "Release",
+                    "Feature ID": None,
+                    "Owner repository": repository,
+                    "Feature type": None,
+                    "Target version": version,
+                    "Release class": _project_release_class(release.get("classification")),
+                    "Risk": _project_risk(_highest_risk(release.get("features"))),
+                    "Depends on": None,
+                    "Dependency state": "Clear",
+                    "PR stage": "None",
+                    "Readiness": "Accepted" if release.get("status") == "ready" else (
+                        "Blocked" if release.get("status") == "blocked" else "Developing"
+                    ),
+                    "Gate progress": percent,
+                    "Evidence": _release_evidence(release.get("features")),
+                    "Release unit": unit_name,
+                    "Plan revision": revision,
+                    "Sync state": "Current",
                 },
             )
-        scenarios = release.get("scenarios")
-        if not isinstance(scenarios, list):
+        features = release.get("features")
+        if not isinstance(features, list):
             continue
-        for scenario in scenarios:
-            if not isinstance(scenario, Mapping):
+        for feature in features:
+            if not isinstance(feature, Mapping):
                 continue
-            scenario_id = str(scenario.get("id"))
-            scenario_marker = _issue_marker(unit_name, "scenario", scenario_id)
-            scenario_type = str(scenario.get("type"))
-            scenario_status = str(scenario.get("status"))
-            scenario_url = _ensure_issue(
-                client,
-                repository,
-                configured_url=scenario.get("issue"),
-                marker=scenario_marker,
-                title=f"[{scenario_id}] {scenario.get('title')}",
-                body=_scenario_issue_body(
-                    scenario, release, scenario_marker, plan_reference
-                ),
-                labels=(
-                    "type:scenario",
-                    f"type:{scenario_type}",
-                    f"semver:{classification}",
-                    f"scenario:{scenario_status}",
-                ),
-                milestone=str(release.get("milestone")),
-                existing=existing_issues[scenario_marker],
-            )
-            if (
-                client.apply
-                and isinstance(scenario, MutableMapping)
-                and isinstance(scenario_url, str)
-            ):
-                scenario["issue"] = scenario_url
-            if project is not None:
-                evidence = scenario.get("evidence")
-                _add_project_issue(
+            feature_id = str(feature.get("id"))
+            marker = _draft_marker(repository, "feature", feature_id)
+            if not isinstance(feature.get("pullRequest"), str):
+                desired_markers.add(marker)
+            pull_request = feature.get("pullRequest")
+            pr_stage = pull_stages.get(str(pull_request), "None")
+            dependency_state = _dependency_projection(feature, dependency_graph, dependency_report)
+            draft = by_marker.get(marker)
+            if isinstance(pull_request, str):
+                item = _ensure_url_item(
                     client,
                     owner=project_owner,
-                    project=project,
-                    project_items=project_items,
-                    fields=fields,
-                    url=scenario_url,
-                    values={
-                        "Target Version": str(release.get("version")),
-                        "Release Class": classification,
-                        "Scenario Type": scenario_type,
-                        "Readiness": scenario_status,
-                        "Target Date": release.get("targetDate"),
-                        "Risk": str(scenario.get("risk")),
-                        "Evidence": (
-                            "\n".join(evidence)
-                            if isinstance(evidence, list) and evidence
-                            else None
-                        ),
-                        "Release Unit": unit_name,
+                    number=project_number,
+                    url=pull_request,
+                    existing=by_url.get(pull_request),
+                )
+                if draft is not None:
+                    _archive_item(client, project_owner, project_number, draft)
+            else:
+                item = _ensure_draft(
+                    client,
+                    owner=project_owner,
+                    number=project_number,
+                    title=f"[{feature_id}] {feature.get('title')}",
+                    body=f"Planned feature projection from `{DEFAULT_PLAN_PATH}`.",
+                    marker=marker,
+                    existing=draft,
+                )
+            if isinstance(item, Mapping) and isinstance(item.get("id"), str):
+                evidence = feature.get("evidence")
+                dependencies = feature.get("dependsOn")
+                _set_project_fields(
+                    client,
+                    project_id,
+                    str(item["id"]),
+                    fields,
+                    {
+                        "Status": _project_feature_status(feature.get("status"), pr_stage),
+                        "Item type": "Feature",
+                        "Feature ID": feature_id,
+                        "Owner repository": repository,
+                        "Feature type": _project_feature_type(feature.get("type")),
+                        "Target version": version,
+                        "Release class": _project_release_class(release.get("classification")),
+                        "Risk": _project_risk(feature.get("risk")),
+                        "Depends on": "\n".join(dependencies) if isinstance(dependencies, list) else None,
+                        "Dependency state": dependency_state,
+                        "PR stage": pr_stage,
+                        "Readiness": _project_readiness(feature.get("status"), pr_stage, dependency_state),
+                        "Gate progress": _gate_progress(feature.get("status"), pr_stage, dependency_state),
+                        "Evidence": "\n".join(evidence) if isinstance(evidence, list) and evidence else None,
+                        "Release unit": unit_name,
+                        "Plan revision": revision,
+                        "Sync state": "Current",
+                    },
+                )
+    managed_prefix = f"<!-- release-plan:{repository}:"
+    for marker, item in by_marker.items():
+        if marker.startswith(managed_prefix) and marker not in desired_markers:
+            item_id = item.get("id")
+            if isinstance(item_id, str):
+                _set_project_fields(
+                    client,
+                    project_id,
+                    item_id,
+                    fields,
+                    {
+                        "Sync state": "Orphan",
                     },
                 )
     return client.operations
 
 
-def _highest_risk(scenarios: Any) -> str | None:
-    if not isinstance(scenarios, list):
-        return None
+def _highest_risk(features: Any) -> str | None:
     order = {"low": 0, "medium": 1, "high": 2}
+    if not isinstance(features, list):
+        return None
     risks = [
-        scenario.get("risk")
-        for scenario in scenarios
-        if isinstance(scenario, Mapping) and scenario.get("risk") in order
+        item.get("risk")
+        for item in features
+        if isinstance(item, Mapping) and item.get("risk") in order
     ]
     return max(risks, key=order.__getitem__) if risks else None
 
 
-def _release_evidence(scenarios: Any) -> str | None:
-    if not isinstance(scenarios, list):
+def _release_evidence(features: Any) -> str | None:
+    if not isinstance(features, list):
         return None
     evidence: list[str] = []
-    for scenario in scenarios:
-        if isinstance(scenario, Mapping) and isinstance(scenario.get("evidence"), list):
-            evidence.extend(str(item) for item in scenario["evidence"])
+    for feature in features:
+        if isinstance(feature, Mapping) and isinstance(feature.get("evidence"), list):
+            evidence.extend(str(item) for item in feature["evidence"])
     return "\n".join(evidence) if evidence else None
+
+
+def _validate_release_url(url: str, repository: str, tag: str) -> None:
+    if not _https_url(url):
+        raise GovernanceError("release-url", "release URL must use HTTPS")
+    parsed = urllib.parse.urlparse(url)
+    if parsed.netloc.lower() != "github.com" or parsed.path.rstrip("/") != f"/{repository}/releases/tag/{tag}":
+        raise GovernanceError("release-url", "release URL does not match repository and tag")
 
 
 def _select_finalize_unit(
     plan: MutableMapping[str, Any], component: str | None
-) -> tuple[MutableMapping[str, Any], str]:
-    profile = plan.get("profile")
-    if profile == "component-semver":
+) -> tuple[MutableMapping[str, Any], str | None]:
+    if plan.get("profile") == "component-semver":
         if not component:
-            raise GovernanceError(
-                "component-required",
-                "component-semver finalization requires --component",
-            )
+            raise GovernanceError("component-required", "component-semver finalization requires --component")
         components = plan.get("components")
-        if not isinstance(components, list):
-            raise GovernanceError("plan-invalid", "components are unavailable")
         matches = [
             item
             for item in components
             if isinstance(item, MutableMapping) and item.get("id") == component
-        ]
+        ] if isinstance(components, list) else []
         if len(matches) != 1:
-            raise GovernanceError(
-                "component-not-found", "requested release component was not found"
-            )
+            raise GovernanceError("component", "component identity is unavailable")
         return matches[0], component
     if component:
-        raise GovernanceError(
-            "component-unexpected", "--component is only valid for component-semver"
-        )
-    return plan, str(plan.get("repository", "repository")).split("/")[-1]
-
-
-def _validate_release_url(url: str, repository: str, tag: str) -> None:
-    if not _is_https_url(url):
-        raise GovernanceError("release-url", "release URL must be an HTTPS URL")
-    parsed = urllib.parse.urlparse(url)
-    expected_path = f"/{repository}/releases/tag/{urllib.parse.quote(tag, safe='')}"
-    if (
-        parsed.netloc.lower() != "github.com"
-        or urllib.parse.unquote(parsed.path) != urllib.parse.unquote(expected_path)
-        or parsed.query
-        or parsed.fragment
-    ):
-        raise GovernanceError(
-            "release-url",
-            "release URL must identify the matching owning-repository GitHub Release",
-        )
-
-
-def _verify_github_release(
-    gh: GhClient,
-    repository: str,
-    tag: str,
-    release_url: str,
-) -> None:
-    encoded = urllib.parse.quote(tag, safe="")
-    gh.json(["api", f"repos/{repository}/git/ref/tags/{encoded}"])
-    release = gh.json(["api", f"repos/{repository}/releases/tags/{encoded}"])
-    if not isinstance(release, Mapping) or release.get("html_url") != release_url:
-        raise GovernanceError(
-            "github-release", "GitHub Release does not match the supplied release URL"
-        )
+        raise GovernanceError("component", "--component is only valid for component-semver")
+    return plan, None
 
 
 def finalize_plan(
@@ -2748,95 +2028,88 @@ def finalize_plan(
     release_url: str,
     released_at: str,
     component: str | None = None,
+    expected_repository: str | None = None,
     github: bool = False,
     gh: GhClient | None = None,
-    expected_repository: str | None = None,
 ) -> dict[str, Any]:
-    """Return a finalized plan copy; no filesystem mutation occurs here."""
-
-    root = Path(repository_root)
     _require_expected_repository(plan, expected_repository)
-    if gh is not None:
-        _require_gh_apply_mode(gh, False)
-    result = copy.deepcopy(dict(plan))
-    report = verify_plan(root, result, check_document=False)
-    if report.errors:
-        first = report.errors[0]
-        raise GovernanceError("plan-invalid", first.message, first.path)
+    result = copy.deepcopy(plan)
     unit, unit_id = _select_finalize_unit(result, component)
     release = unit.get("nextRelease")
     if not isinstance(release, MutableMapping):
-        raise GovernanceError("no-next-release", "there is no release to finalize")
+        raise GovernanceError("release-missing", "no next release is available")
     if release.get("status") != "ready":
         raise GovernanceError("release-not-ready", "only a ready release can be finalized")
+    if not _is_datetime(released_at):
+        raise GovernanceError("released-at", "releasedAt must be an RFC 3339 date-time")
     version = release.get("version")
-    if not isinstance(version, str):
-        raise GovernanceError("plan-invalid", "release version is invalid")
-    repository = result.get("repository")
-    if not isinstance(repository, str):
-        raise GovernanceError("plan-invalid", "repository is invalid")
-    tag = _release_tag(result.get("profile"), unit_id if component else None, version)
+    tag = _release_tag(result.get("profile"), unit_id, version)
+    repository = str(result["repository"])
     _validate_release_url(release_url, repository, tag)
-    try:
-        _parse_datetime(released_at)
-    except ValueError as exc:
-        raise GovernanceError(
-            "released-at", "released-at must be an RFC 3339 date-time with timezone"
-        ) from exc
-    history = unit.get("releases")
-    if not isinstance(history, list):
-        raise GovernanceError("plan-invalid", "release history is invalid")
-    if any(
-        isinstance(item, Mapping) and item.get("version") == version for item in history
-    ):
-        raise GovernanceError(
-            "release-duplicate", "release version is already present in history"
-        )
     if github:
-        _verify_github_release(gh or GhClient(apply=False), repository, tag, release_url)
-    record = copy.deepcopy(dict(release))
-    record["releasedAt"] = released_at
-    record["releaseUrl"] = release_url
-    history.append(record)
+        client = gh or GhClient(apply=False)
+        try:
+            data = client.json(["api", f"repos/{repository}/releases/tags/{urllib.parse.quote(tag, safe='')}"])
+        except GovernanceError as exc:
+            raise GovernanceError(exc.code, exc.message) from exc
+        if not isinstance(data, Mapping) or data.get("html_url") != release_url:
+            raise GovernanceError("github-release", "GitHub Release does not match declared URL")
+    releases = unit.get("releases")
+    if not isinstance(releases, list):
+        raise GovernanceError("plan-invalid", "release history is unavailable")
+    if any(isinstance(item, Mapping) and item.get("version") == version for item in releases):
+        raise GovernanceError("release-duplicate", "release version is already archived")
+    archived = dict(release)
+    archived["releasedAt"] = released_at
+    archived["releaseUrl"] = release_url
+    releases.append(archived)
     unit["currentVersion"] = version
     unit["nextRelease"] = None
+    report = verify_plan(repository_root, result, check_document=False)
+    if not report.ok:
+        first = report.errors[0]
+        raise GovernanceError(first.code, first.message, first.path)
     return result
 
 
+def _atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
 def _plan_json(plan: Mapping[str, Any]) -> str:
-    return json.dumps(plan, ensure_ascii=False, indent=2) + "\n"
+    return json.dumps(plan, indent=2, ensure_ascii=False) + "\n"
 
 
 def _print_report(report: VerificationReport, *, as_json: bool = False) -> None:
     if as_json:
-        payload = {
-            "ok": report.ok,
-            "errors": [
-                dataclasses.asdict(finding) for finding in report.errors
-            ],
-            "warnings": [
-                dataclasses.asdict(finding) for finding in report.warnings
-            ],
-        }
-        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        print(json.dumps([dataclasses.asdict(item) for item in report.findings], indent=2))
         return
+    for item in report.findings:
+        location = f" [{item.path}]" if item.path else ""
+        print(f"{item.severity}: {item.code}{location}: {item.message}")
     if report.ok:
-        print("OK release governance verified")
-    for finding in report.findings:
-        location = f" {finding.path}" if finding.path else ""
-        print(
-            f"{finding.severity.upper()} [{finding.code}]{location}: {finding.message}"
-        )
+        print("version-governance: ok")
 
 
 def _print_operations(operations: Sequence[str], *, applied: bool) -> None:
-    action = "applied" if applied else "would apply"
+    prefix = "APPLIED" if applied else "DRY-RUN"
     if not operations:
-        print("OK no changes required")
-        return
-    print(f"OK {action} {len(operations)} idempotent operation(s)")
+        print(f"{prefix}: no changes")
     for operation in operations:
-        print(f"- {operation}")
+        print(f"{prefix}: {operation}")
 
 
 def _common_plan_arguments(parser: argparse.ArgumentParser) -> None:
@@ -2845,49 +2118,34 @@ def _common_plan_arguments(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Verify and synchronize LicoLand repository release plans"
-    )
+    parser = argparse.ArgumentParser(description="Verify LicoLand repository release plans")
     subparsers = parser.add_subparsers(dest="command", required=True)
-
-    verify = subparsers.add_parser("verify", help="verify the repository release plan")
+    verify = subparsers.add_parser("verify")
     _common_plan_arguments(verify)
     verify.add_argument("--github", action="store_true")
     verify.add_argument("--expected-repository")
     verify.add_argument("--tag")
     verify.add_argument("--json", action="store_true", dest="as_json")
-
-    render = subparsers.add_parser("render", help="render docs/releases/README.md")
+    render = subparsers.add_parser("render")
     _common_plan_arguments(render)
     render.add_argument("--apply", action="store_true")
     render.add_argument("--check", action="store_true")
-
-    bootstrap = subparsers.add_parser(
-        "bootstrap-project", help="ensure the private organization release portfolio"
-    )
-    bootstrap.add_argument(
-        "--project-owner", "--organization", "--owner", dest="project_owner", default="LicoLand"
-    )
+    bootstrap = subparsers.add_parser("bootstrap-project")
+    bootstrap.add_argument("--project-owner", "--organization", "--owner", dest="project_owner", default="LicoLand")
     bootstrap.add_argument("--project-title", default=DEFAULT_PROJECT_TITLE)
     bootstrap.add_argument("--apply", action="store_true")
-
-    sync = subparsers.add_parser(
-        "sync-github", help="synchronize repository GitHub release objects"
-    )
+    sync = subparsers.add_parser("sync-project")
     _common_plan_arguments(sync)
     sync.add_argument("--project-owner", default="LicoLand")
     sync.add_argument("--project-title", default=DEFAULT_PROJECT_TITLE)
-    sync.add_argument("--expected-repository")
+    sync.add_argument("--expected-repository", required=True)
     sync.add_argument("--apply", action="store_true")
-
-    finalize = subparsers.add_parser(
-        "finalize", help="archive a published ready release in the repository plan"
-    )
+    finalize = subparsers.add_parser("finalize")
     _common_plan_arguments(finalize)
     finalize.add_argument("--release-url", required=True)
     finalize.add_argument("--released-at", required=True)
-    finalize.add_argument("--component", "--release-unit", dest="component")
-    finalize.add_argument("--expected-repository")
+    finalize.add_argument("--component")
+    finalize.add_argument("--expected-repository", required=True)
     finalize.add_argument("--github", action="store_true")
     finalize.add_argument("--apply", action="store_true")
     return parser
@@ -2908,33 +2166,21 @@ def _command_verify(args: argparse.Namespace) -> int:
 def _command_render(args: argparse.Namespace) -> int:
     root = Path(args.repository_root)
     plan, _ = load_plan(root, args.plan)
-    report = _validate_plan_shape(plan)
-    _validate_profile_contract(report, plan)
-    _validate_release_contracts(report, plan, root)
-    if report.errors:
-        _print_report(report)
-        return 1
+    content = render_release_document(plan)
     target = _safe_path(root, DOCUMENT_PATH)
-    rendered = render_release_document(plan)
-    try:
-        current = target.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        current = None
-    except (OSError, UnicodeError) as exc:
-        raise GovernanceError(
-            "document-unreadable",
-            "generated release document cannot be read",
-            _display_path(root, target),
-        ) from exc
-    if current == rendered:
-        print("OK generated release document is current")
+    current = target.read_text(encoding="utf-8") if target.exists() else None
+    if current == content:
+        print("version-governance: release document is current")
         return 0
+    if args.check:
+        print("version-governance: release document is stale", file=sys.stderr)
+        return 1
     if args.apply:
-        _atomic_write(target, rendered)
-        print(f"OK updated {_display_path(root, target)}")
-        return 0
-    print(f"DRY-RUN would update {_display_path(root, target)}")
-    return 1 if args.check else 0
+        _atomic_write(target, content)
+        print("APPLIED: release document rendered")
+    else:
+        print(content, end="")
+    return 0
 
 
 def _command_bootstrap(args: argparse.Namespace) -> int:
@@ -2949,28 +2195,15 @@ def _command_bootstrap(args: argparse.Namespace) -> int:
 
 def _command_sync(args: argparse.Namespace) -> int:
     root = Path(args.repository_root)
-    plan, plan_path = load_plan(root, args.plan)
-    if args.apply and plan_path.suffix.lower() != ".json":
-        raise GovernanceError(
-            "plan-format",
-            "sync-github --apply requires a JSON release plan",
-            _display_path(root, plan_path),
-        )
-    operations = sync_github(
+    plan, _ = load_plan(root, args.plan)
+    operations = sync_project(
         root,
         plan,
         project_owner=args.project_owner,
         project_title=args.project_title,
-        apply=args.apply,
-        plan_reference=_display_path(root, plan_path),
         expected_repository=args.expected_repository,
+        apply=args.apply,
     )
-    if args.apply:
-        _atomic_write(plan_path, _plan_json(plan))
-        _atomic_write(
-            _safe_path(root, DOCUMENT_PATH),
-            render_release_document(plan),
-        )
     _print_operations(operations, applied=args.apply)
     return 0
 
@@ -2978,37 +2211,27 @@ def _command_sync(args: argparse.Namespace) -> int:
 def _command_finalize(args: argparse.Namespace) -> int:
     root = Path(args.repository_root)
     plan, plan_path = load_plan(root, args.plan)
-    if plan_path.suffix.lower() != ".json":
-        raise GovernanceError(
-            "plan-format", "finalize requires a JSON release plan", _display_path(root, plan_path)
-        )
     finalized = finalize_plan(
         root,
         plan,
         release_url=args.release_url,
         released_at=args.released_at,
         component=args.component,
-        github=args.github,
         expected_repository=args.expected_repository,
+        github=args.github,
     )
-    plan_content = _plan_json(finalized)
-    document_content = render_release_document(finalized)
-    document_path = _safe_path(root, DOCUMENT_PATH)
-    if not args.apply:
-        print(
-            "DRY-RUN would archive the ready release and render "
-            f"{_display_path(root, document_path)}"
-        )
-        return 0
-    _atomic_write(plan_path, plan_content)
-    _atomic_write(document_path, document_content)
-    print("OK finalized release history and regenerated release document")
+    document = render_release_document(finalized)
+    if args.apply:
+        _atomic_write(plan_path, _plan_json(finalized))
+        _atomic_write(_safe_path(root, DOCUMENT_PATH), document)
+        print("APPLIED: release plan finalized")
+    else:
+        print("DRY-RUN: release plan would be finalized")
     return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+    args = build_parser().parse_args(argv)
     try:
         if args.command == "verify":
             return _command_verify(args)
@@ -3016,16 +2239,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _command_render(args)
         if args.command == "bootstrap-project":
             return _command_bootstrap(args)
-        if args.command == "sync-github":
+        if args.command == "sync-project":
             return _command_sync(args)
         if args.command == "finalize":
             return _command_finalize(args)
-        parser.error("unsupported command")
     except GovernanceError as exc:
-        location = f" {exc.path}" if exc.path else ""
-        print(f"ERROR [{exc.code}]{location}: {exc.message}", file=sys.stderr)
+        location = f" [{exc.path}]" if exc.path else ""
+        print(f"error: {exc.code}{location}: {exc.message}", file=sys.stderr)
         return 2
-    return 2
+    raise AssertionError("unreachable")
 
 
 if __name__ == "__main__":
