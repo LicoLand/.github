@@ -1,7 +1,7 @@
 name: repository-release-governance
 
 on:
-  pull_request_target:
+  pull_request:
     types:
       - opened
       - synchronize
@@ -17,13 +17,13 @@ on:
 
 permissions:
   contents: read
-  issues: read
+  pull-requests: read
 
 jobs:
   version-governance:
-    uses: LicoLand/.github/.github/workflows/reusable-version-governance.yml@0875118889c39df343afeb6f4aa6e82f9690cc4d
+    uses: LicoLand/.github/.github/workflows/reusable-version-governance.yml@e01536adb12ab0e321312db62028c2a3913ee80e
     with:
-      governance_ref: "0875118889c39df343afeb6f4aa6e82f9690cc4d"
+      governance_ref: "e01536adb12ab0e321312db62028c2a3913ee80e"
       target_repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
       target_ref: ${{ github.event.pull_request.head.sha || github.sha }}
       expected_repository: ${{ github.repository }}

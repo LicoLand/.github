@@ -1,269 +1,224 @@
 # Organization Version Governance
 
-This document is the organization-wide authority for planning and releasing
-versioned LicoLand projects. Product behavior, acceptance criteria, and release
+This document defines the organization-wide contract for planning and
+releasing versioned LicoLand repositories. Product behavior, acceptance, and
 evidence remain owned by the repository that implements them.
 
 ## Independent repository versions
 
-There is no organization-wide product version, synchronized release train, or
-shared release scope. Each product repository or independently versioned
-component owns its current version, next release, scenarios, milestone, tag,
-and GitHub Release. For example, one repository may publish `0.2.0` while
-another remains at `0.1.4`.
+There is no organization-wide product version or synchronized release train.
+Each product repository or independently versioned component owns its current
+version, next release, feature contracts, tag, and GitHub Release.
 
-The organization `.github` repository supplies only the common schema, issue
-and pull-request templates, verifier, and reusable workflow callers. The
-private organization Project is an aggregate portfolio: its `Target Version`
-field records the owning repository item's version and never creates an
-organization version. `governance`, `continuous-site`, and `inactive` profiles
-do not become product versions merely because they use the common template.
-
-For interactive adoption, GitHub exposes one native Actions starter named
-`LicoLand Repository Release Governance`. It combines the read-only
-version-contract job and the independent Lico-Auditor job, and replaces
-`$default-branch` with the adopting repository's default branch. Automated
-rollout may use the equivalent files under `templates/repository/`.
+The organization `.github` repository supplies the common schema, pull-request
+template, verifier, Project projection tool, and reusable workflow. The
+organization Project is an aggregate view of repository plans; it is never a
+release authority.
 
 ## Governing model
 
-Every release fact has one owner:
+Every fact has one owner:
 
 | Fact | Authority |
 | --- | --- |
-| Organization portfolio, cross-repository status, target dates, and risk | The private organization GitHub Project named `LicoLand Release Portfolio` |
-| A repository release boundary and completion percentage | A repository milestone named `vMAJOR.MINOR.PATCH` |
-| A required capability, breaking change, or fix | A real issue in the owning repository |
-| Version scope, acceptance criteria, evidence, and release history | `docs/releases/plan.json` in the owning repository |
-| Human-readable repository release status | Generated `docs/releases/README.md` |
-| Implementation | Pull requests that close the owning issues |
+| Version scope, feature IDs, dependencies, acceptance, evidence, and history | `docs/releases/plan.json` |
+| Human-readable release status | Generated `docs/releases/README.md` |
+| Implementation | One Draft pull request per feature, targeting the release's `integrationBranch` |
+| Cross-repository ordering | Canonical `Owner/Repository:feature-id` references in `dependsOn` |
+| Portfolio status and progress | A projection in `LicoLand Release Portfolio` |
 | Published result | An immutable release-unit tag and GitHub Release |
 
-GitHub Project items, milestone descriptions, generated documentation, and
-release notes link to the owning repository plan. They must not restate a
-different set of acceptance criteria.
+Issues remain available for optional defect reports and discussion. They do
+not represent a planned release, feature, dependency, completion percentage,
+or release gate. Milestones are not part of version governance.
 
 ## Release profiles
 
-Every first-party repository declares exactly one profile.
+Every first-party repository declares exactly one profile:
 
 | Profile | Use |
 | --- | --- |
 | `semver` | One independently released product or package |
 | `component-semver` | Independently released components in one repository |
-| `continuous-site` | A continuously delivered site that does not own product versions |
-| `inactive` | A repository that cannot publish until it owns an implemented release unit |
-| `governance` | Organization metadata and shared automation, not a product release |
+| `continuous-site` | A continuously delivered site without product versions |
+| `inactive` | A repository that cannot currently publish |
+| `governance` | Organization metadata and shared automation |
 
-The last three profiles reject stable product-version tags. A site deployment,
-governance change, or empty marketplace must not create a product version.
+The last three profiles reject stable product-version tags.
 
 ## Version classification
 
-Stable releases use `MAJOR.MINOR.PATCH`. LicoLand applies the same rules while
-the major version is zero; `0.x` is not an exception.
+Stable releases use `MAJOR.MINOR.PATCH`. The same rules apply while the major
+version is zero.
 
-| Classification | Required transition | Required scenarios |
+| Classification | Required transition | Required features |
 | --- | --- | --- |
-| `patch` | `X.Y.Z` to `X.Y.(Z+1)` | One or more fixes; no capability or breaking scenario |
-| `minor` | `X.Y.Z` to `X.(Y+1).0` | At least one new, independently acceptable capability scenario; fixes may be included |
-| `major` | `X.Y.Z` to `(X+1).0.0` | At least one breaking scenario with migration acceptance; capabilities and fixes may be included |
-| `initial` | No released version to `0.1.0` | At least one accepted capability scenario |
-| `stabilization` | A prerelease to the same stable core, or `0.y.z` to `1.0.0` | At least one accepted capability scenario and no hidden version skip |
+| `patch` | `X.Y.Z` to `X.Y.(Z+1)` | One or more fixes only |
+| `minor` | `X.Y.Z` to `X.(Y+1).0` | At least one capability; no breaking feature |
+| `major` | `X.Y.Z` to `(X+1).0.0` | At least one breaking feature with migration acceptance |
+| `initial` | No release to `0.1.0` | At least one capability |
+| `stabilization` | A prerelease to its stable core, or `0.y.z` to `1.0.0` | At least one capability |
 
-Transitions are sequential. A patch, minor, or major component cannot skip its
-next numeric value. Minor and major releases reset lower components to zero.
-A bug fix by itself therefore advances `0.1.0` to `0.1.1`, then `0.1.2`; it
-cannot justify `0.2.0`.
+Transitions are sequential. Minor and major releases reset lower components to
+zero. A fix-only release therefore advances `0.1.0` to `0.1.1`; it cannot
+justify `0.2.0`.
 
-An existing prerelease baseline may only stabilize to its exact stable core.
-This workflow publishes stable tags; candidate builds are CI artifacts, not
-additional releases or milestones. A repository-wide release uses
-`vMAJOR.MINOR.PATCH`. An independently versioned component uses
-`COMPONENT-vMAJOR.MINOR.PATCH`, so two components may own the same version
-without sharing a tag.
+Repository tags use `vMAJOR.MINOR.PATCH`. Component tags use
+`COMPONENT-vMAJOR.MINOR.PATCH`.
 
-## Scenario contract
+## Feature contract
 
-A version plan contains one entry per independently acceptable scenario:
+Schema version 2 contains one entry per independently acceptable feature:
 
-- a stable scenario identifier;
+- a repository-global, stable lowercase slug ID;
 - one of `capability`, `breaking`, or `fix`;
 - a concise outcome title;
-- a real owning-repository issue;
-- explicit acceptance statements;
-- a risk level;
-- lifecycle status; and
-- evidence links when accepted.
+- lifecycle status;
+- an owning-repository pull request when development has started;
+- canonical dependency references;
+- risk and observable acceptance statements; and
+- reviewed, sanitized evidence when accepted.
 
-The lifecycle is `planned` → `active` → `accepted`. `blocked` is an explicit
-side state. A release moves through `planned` → `active` → `ready`, with
-`blocked` available when necessary.
+Feature IDs remain globally unique across the repository's root, components,
+next releases, and archived releases. A dependency always uses the full form
+`Owner/Repository:feature-id`, including for a dependency in the same
+repository. This makes a reference stable and unambiguous across independently
+versioned components.
 
-`ready` means:
+The feature lifecycle is:
 
-- the version transition and scenario mix satisfy this policy;
-- every scenario is accepted and has evidence;
-- every scenario issue and the release issue are closed;
-- the repository milestone is closed with no open items;
+1. `planned`: the contract is accepted and `pullRequest` is `null`.
+2. `active`: a Draft or review-ready implementation pull request is open.
+3. `blocked`: a dependency or explicit release blocker prevents progress; the
+   pull request may be absent or open.
+4. `accepted`: the implementation pull request is merged to the declared
+   `integrationBranch` and the plan records reviewed evidence.
+
+A feature cannot mark itself accepted inside its own implementation pull
+request: that pull request is not merged yet. After merge, use a small
+plan-only pull request to record `accepted` and its evidence.
+
+The verifier rejects duplicate IDs or pull requests, missing local
+dependencies, self-dependencies, dependency cycles, and an accepted feature
+whose dependency is not accepted. Remote verification reads cross-repository
+plans from their default branches as untrusted bounded JSON and applies the
+same rules.
+
+## Release readiness
+
+A release moves through `planned`, `active`, `blocked`, and `ready`. `ready`
+means:
+
+- its version transition and feature mix satisfy this policy;
+- it has no unresolved release blocker;
+- every feature is accepted with reviewed evidence;
+- every implementation pull request is merged to its release's
+  `integrationBranch`;
+- every transitive dependency exists and is accepted;
 - the version source and changelog name the target version;
-- the repository's own build, security, packaging, and acceptance checks pass;
-  and
+- repository-owned build, security, packaging, and acceptance checks pass; and
 - the independent Lico-Auditor final gate passes.
 
-The organization version-contract gate does not replace a product repository's
-release checks or the independent audit.
+Project availability, Project fields, Project views, projection lag, Issues,
+and Milestones cannot approve or block a release.
 
-## Agent implementation and independent audit
+## Draft pull-request implementation
 
-Lico-Dev and Lico-Auditor have deliberately separate authorities:
+Use this implementation sequence:
 
-1. Lico-Dev's `$lico-release-engineering-workflow` reads the owning
-   `docs/releases/plan.json`, routes the scenario to its canonical repository
-   owner, implements one independently acceptable closure, and produces
-   sanitized acceptance receipts.
-2. The organization template standardizes the version contract and verifies
-   that the declared transition, scenarios, issues, milestone, evidence, and
-   release state agree.
-3. Lico-Auditor independently audits the candidate change and, for a stable tag
-   or explicit release-readiness dispatch, all reachable content history.
+1. Merge a plan-only pull request that adds a `planned` feature with a stable
+   ID and `pullRequest: null`.
+2. Create a temporary branch and immediately open one Draft pull request to
+   the release's `integrationBranch`.
+3. In that Draft pull request, set the feature to `active` and record its PR
+   URL. Continue implementation and targeted verification on the same PR.
+4. When acceptance checks pass, mark the PR ready for review.
+5. Pass repository gates and Lico-Auditor, then merge to the declared branch.
+6. Merge a plan-only acceptance PR that records evidence and changes the
+   feature to `accepted`.
 
-Lico-Dev cannot approve its own final audit. The trusted repository caller
-passes no repository, ref, profile, or secret input to Lico-Auditor. The
-Auditor derives those facts from the GitHub event, verifies its canonical
-`only` source, treats the target checkout as data, and never executes target
-repository code.
+Do not combine unrelated feature IDs in one implementation pull request.
+Repositories using the canonical promotion flow set `integrationBranch` to
+`nightly` and then promote `nightly` → `stable` → `release`; repositories with
+a different maintained branch topology declare their actual integration branch
+instead.
 
-Implementation receipts, version-contract verification, repository acceptance,
-and the Auditor answer different questions. None can substitute for another,
-and no administrator bypass may turn a failed claim into a release.
+## Project projection
 
-## GitHub Project
+`LicoLand Release Portfolio` is an operator-managed projection. `sync-project`
+creates one Draft Project item for each release summary and for each planned
+feature without a pull request. When a feature gains a pull request, the tool
+adds that PR and archives the superseded Draft Item.
 
-`LicoLand Release Portfolio` is private because it can contain items from
-non-public repositories. The bootstrap tool creates these fields:
+The projection records the configured Project fields:
 
-| Field | Type |
-| --- | --- |
-| `Target Version` | Text |
-| `Release Class` | Single select |
-| `Scenario Type` | Single select |
-| `Readiness` | Single select |
-| `Target Date` | Date |
-| `Risk` | Single select |
-| `Evidence` | Text |
-| `Release Unit` | Text |
+- `Status`, `Item type`, `Feature ID`, and `Owner repository`;
+- `Feature type`, `Target version`, `Release class`, and `Risk`;
+- `Depends on`, `Dependency state`, and `PR stage`;
+- `Readiness`, `Gate progress`, and `Evidence`; and
+- `Release unit`, `Plan revision`, and `Sync state`.
 
-Repository and milestone remain GitHub system fields. Project items must be
-real issues, not draft items. The shared tool adds or updates the release issue
-and all scenario issues idempotently.
+GitHub's system `Target date` and `Start date` fields remain system-owned.
+The tool does not create or edit Project views. It marks retired managed Draft
+Items as `Orphan`; a Project operator may archive or delete them separately.
 
-Interactive project bootstrap and synchronization use an operator credential
-with organization Projects read/write permission and repository Issues
-read/write permission. Never store this write-capable credential in Actions.
+Bootstrap or inspect the Project fields:
 
-The Project is an operator-managed aggregate projection, not release
-authority. `sync-github` maintains its items and fields, while
-`verify --github` deliberately verifies only the owning repository's issues,
-milestone, and tag. Project availability or projection lag therefore never
-changes the outcome of the required version-governance check.
+```bash
+python3 tools/release_governance.py bootstrap-project \
+  --project-owner LicoLand \
+  --project-title "LicoLand Release Portfolio"
+```
 
-## Branch enforcement
+Add `--apply` only after reviewing the dry run.
 
-Every first-party repository must have an active repository ruleset named
-`LicoLand version governance`. It targets only the repository's default branch
-and strictly requires the exact check context
-`version-governance / version-governance`. Keep this rule separate from
-repository-specific audit, review, linear-history, and deletion rules so adding
-version governance never rewrites or weakens an existing protection.
+Project a repository plan:
 
-Bootstrap enforcement in this order:
+```bash
+python3 tools/release_governance.py sync-project \
+  --repository-root <repo-root> \
+  --plan docs/releases/plan.json \
+  --expected-repository LicoLand/<repo> \
+  --project-owner LicoLand \
+  --project-title "LicoLand Release Portfolio"
+```
 
-1. Merge the pinned repository caller workflow.
-2. Grant the workflow only `contents: read` and `issues: read`, dispatch
-   `version-governance.yml` once on the default branch, and confirm the exact
-   required check succeeds.
-3. Create the active ruleset with no bypass actors.
-4. Read the ruleset back and confirm its branch, context, and strict mode.
+Again, `--apply` is required for writes. Project synchronization uses an
+already authenticated operator CLI session and never stores its credential in
+Actions.
 
-Install `.github/workflows/lico-auditor-release-gate.yml` separately. After its
-default-branch candidate check succeeds, require the exact additional context
-`lico-auditor / final-gate` with no bypass actors. Do not activate that required
-context before the caller exists and has a successful run. Before a stable tag,
-an explicit dispatch of the same workflow must also pass its full-history
-phase.
-
-## Repository files
+## Required repository files
 
 Each repository carries:
 
-- `docs/releases/plan.json`, the structured release authority;
+- `docs/releases/plan.json`, the structured authority;
 - `docs/releases/README.md`, generated from that plan;
 - `tools/release/verify-version-governance`, a thin wrapper pinned to an
-  immutable organization-tool revision and digest; and
-- `.github/workflows/version-governance.yml`, the read-only local and GitHub
-  release-state gate pinned to the same reusable workflow revision; and
-- `.github/workflows/lico-auditor-release-gate.yml`, the input-free trusted
-  caller for Lico-Auditor candidate and full-history final gates.
+  immutable organization verifier revision and digest;
+- `.github/workflows/version-governance.yml`, the read-only plan, PR, and tag
+  gate pinned to the same revision; and
+- `.github/workflows/lico-auditor-release-gate.yml`, the independent audit
+  caller.
 
-The native organization starter lives at
-`workflow-templates/licoland-repository-release-governance.yml` with its
-matching `.properties.json` metadata file. It is the single GitHub UI entry for
-the version-contract and Auditor baseline. The reusable version-governance
-workflow uses the repository-provided `github.token`; no separately provisioned
-secret or environment is required.
+The reusable gate needs only `contents: read` and `pull-requests: read`.
+It uses the repository-provided GitHub token. Cross-repository dependencies in
+private repositories require an explicitly provisioned read-only GitHub App
+token; without one, remote dependency verification fails closed.
 
-Edit the plan, then regenerate and verify:
+Edit, render, and verify:
 
 ```bash
 tools/release/verify-version-governance render --apply
 tools/release/verify-version-governance verify
 ```
 
-Synchronize GitHub only after reviewing the dry run:
+## Publication boundary
 
-```bash
-python3 tools/release_governance.py sync-github \
-  --repository-root <repo-root> \
-  --plan docs/releases/plan.json \
-  --expected-repository LicoLand/<repo> \
-  --project-owner LicoLand \
-  --project-title "LicoLand Release Portfolio"
+After a ready release passes repository acceptance and Lico-Auditor, create its
+matching tag. Treat the tag as a candidate until the tag governance and
+full-history audit checks pass. Publish a GitHub Release only after applicable
+tag checks succeed, then finalize the plan so the release enters immutable
+history.
 
-python3 tools/release_governance.py sync-github \
-  --repository-root <repo-root> \
-  --plan docs/releases/plan.json \
-  --expected-repository LicoLand/<repo> \
-  --project-owner LicoLand \
-  --project-title "LicoLand Release Portfolio" \
-  --apply
-```
-
-The first command is read-only. `--apply` is required for every GitHub write.
-
-## Release lifecycle
-
-1. Add the target version and scenarios to the owning repository plan.
-2. Invoke Lico-Dev's `$lico-release-engineering-workflow`; bind the declared
-   release contract, render the repository documentation, and run the local
-   verifier before implementation.
-3. Run `sync-github` to create or update labels, the milestone, the release
-   issue, scenario issues, and Project items.
-4. Implement one independently acceptable scenario at a time through the
-   canonical Lico-Dev owner workflow and a pull request that closes its issue.
-5. Record reviewed, sanitized Lico-Dev receipts in the plan and mark accepted
-   scenarios.
-6. In the release pull request, set the release to `ready`, update the version
-   source and changelog, and pass repository acceptance, the version-governance
-   contract and GitHub-state gate, and the Lico-Auditor candidate gate.
-7. Explicitly dispatch `lico-auditor-release-gate.yml` and require its
-   full-history phase to pass. Then close the release issue and milestone and
-   create the matching tag.
-8. Treat the pushed tag as a release candidate until its version-governance
-   Issue/Milestone/Tag check and Lico-Auditor full-history gate succeed.
-9. Publish the GitHub Release only after every applicable tag check succeeds.
-10. Finalize the plan so the released contract enters immutable repository
-   history and the next release returns to an unplanned state.
-
-Store/channel publication, signing identities, notarization, and third-party
-distribution remain separate from GitHub Release readiness.
+Development, verification, packaging, GitHub Release, signing, and every
+external store or distribution channel remain separate claims.

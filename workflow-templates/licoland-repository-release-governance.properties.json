@@ -1,6 +1,6 @@
 {
   "name": "LicoLand Repository Release Governance",
-  "description": "Validate an independent repository version contract and run the Lico-Auditor final gate.",
+  "description": "Validate plan-driven features and Draft PR evidence, then run the independent Lico-Auditor gate.",
   "categories": [
     "Automation"
   ]
