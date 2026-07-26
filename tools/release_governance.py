@@ -1514,11 +1514,11 @@ def _project_items(
         content = item.get("content")
         if not isinstance(content, Mapping):
             continue
-        url = content.get("url")
-        if isinstance(url, str):
-            if url in by_url:
+        item_link = content.get("url")
+        if isinstance(item_link, str):
+            if item_link in by_url:
                 raise GovernanceError("github-project-item-duplicate", "project contains duplicate URL item")
-            by_url[url] = item
+            by_url[item_link] = item
         body = content.get("body")
         if isinstance(body, str):
             for marker in re.findall(r"<!-- release-plan:[^>]+ -->", body):
