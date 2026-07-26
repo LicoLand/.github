@@ -1365,10 +1365,17 @@ def _find_project(gh: GhClient, owner: str, title: str) -> Mapping[str, Any] | N
 
 
 def _field_type(field: Mapping[str, Any]) -> str | None:
-    for key in ("dataType", "type"):
-        value = field.get(key)
-        if isinstance(value, str):
-            return value.upper()
+    data_type = field.get("dataType")
+    if isinstance(data_type, str):
+        return data_type.upper()
+    graphql_type = field.get("type")
+    if graphql_type == "ProjectV2SingleSelectField":
+        return "SINGLE_SELECT"
+    # ``gh project field-list --format json`` reports every text, date, and
+    # number field as the generic ProjectV2Field and omits its data type. The
+    # configured FIELD_SPECS remains the mutation authority for those fields.
+    if graphql_type == "ProjectV2Field":
+        return None
     return None
 
 
@@ -1506,6 +1513,12 @@ def _project_items(
     items = data.get("items", []) if isinstance(data, Mapping) else data
     if not isinstance(items, list):
         raise GovernanceError("github-response", "project item list has invalid shape")
+    total_count = data.get("totalCount") if isinstance(data, Mapping) else None
+    if isinstance(total_count, int) and total_count > len(items):
+        raise GovernanceError(
+            "github-project-limit",
+            "project contains more items than the bounded synchronization read",
+        )
     by_url: dict[str, Mapping[str, Any]] = {}
     by_marker: dict[str, Mapping[str, Any]] = {}
     for item in items:
@@ -1542,6 +1555,7 @@ def _set_project_fields(
     fields: Mapping[str, Mapping[str, Any]],
     values: Mapping[str, str | int | None],
 ) -> None:
+    expected_types = {name: data_type for name, data_type, _ in FIELD_SPECS}
     for name, value in values.items():
         if value is None:
             continue
@@ -1556,7 +1570,7 @@ def _set_project_fields(
             "--field-id",
             str(field["id"]),
         ]
-        data_type = _field_type(field)
+        data_type = _field_type(field) or expected_types[name]
         if data_type == "SINGLE_SELECT":
             option = _option_id(field, str(value))
             if option is None:
@@ -1807,7 +1821,7 @@ def sync_project(
             "--owner",
             project_owner,
             "--limit",
-            "1000",
+            "500",
             "--format",
             "json",
         ]

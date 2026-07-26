@@ -537,6 +537,29 @@ def project_fields() -> list[dict[str, Any]]:
     return result
 
 
+def real_gh_project_fields() -> list[dict[str, Any]]:
+    """Representative shape returned by gh project field-list --format json."""
+
+    result = []
+    for index, (name, data_type, options) in enumerate(governance.FIELD_SPECS):
+        result.append(
+            {
+                "id": f"FIELD_{index}",
+                "name": name,
+                "type": (
+                    "ProjectV2SingleSelectField"
+                    if data_type == "SINGLE_SELECT"
+                    else "ProjectV2Field"
+                ),
+                "options": [
+                    {"id": f"OPTION_{index}_{option_index}", "name": option}
+                    for option_index, option in enumerate(options)
+                ],
+            }
+        )
+    return result
+
+
 class ProjectFake:
     def __init__(
         self,
@@ -544,12 +567,15 @@ class ProjectFake:
         apply: bool,
         items: list[dict[str, Any]] | None = None,
         public: bool = False,
+        real_field_shape: bool = False,
     ):
         self.apply = apply
         self.operations: list[str] = []
         self.items = items or []
         self.public = public
+        self.real_field_shape = real_field_shape
         self.read_calls: list[list[str]] = []
+        self.mutation_calls: list[tuple[str, list[str]]] = []
         self.mutation_started = False
 
     def json(self, arguments: Sequence[str]) -> Any:
@@ -569,9 +595,15 @@ class ProjectFake:
                 ]
             }
         if command == ["project", "item-list"]:
-            return {"items": self.items}
+            return {"items": self.items, "totalCount": len(self.items)}
         if command == ["project", "field-list"]:
-            return {"fields": project_fields()}
+            return {
+                "fields": (
+                    real_gh_project_fields()
+                    if self.real_field_shape
+                    else project_fields()
+                )
+            }
         if "/pulls/" in endpoint:
             return {
                 "state": "open",
@@ -590,11 +622,13 @@ class ProjectFake:
     def mutate_text(self, operation: str, arguments: Sequence[str]) -> str | None:
         self.mutation_started = True
         self.operations.append(operation)
+        self.mutation_calls.append((operation, list(arguments)))
         return "" if self.apply else None
 
     def mutate_json(self, operation: str, arguments: Sequence[str]) -> Any:
         self.mutation_started = True
         self.operations.append(operation)
+        self.mutation_calls.append((operation, list(arguments)))
         if not self.apply:
             return None
         if operation == "project.draft.create":
@@ -702,6 +736,42 @@ class ProjectProjectionTests(unittest.TestCase):
         self.assertIn("Owner repository", configured)
         self.assertIn("Dependency state", configured)
         self.assertIn("Gate progress", configured)
+
+    def test_real_gh_field_shape_supports_select_text_and_number_mutations(self) -> None:
+        document = plan()
+        document["nextRelease"]["features"][0].update(
+            status="active",
+            pullRequest="https://github.com/LicoLand/App/pull/7",
+        )
+        fixture = self.fixture_for(document)
+        fake = ProjectFake(apply=True, real_field_shape=True)
+        operations = governance.sync_project(
+            fixture.root,
+            document,
+            project_owner="LicoLand",
+            expected_repository="LicoLand/App",
+            apply=True,
+            gh=fake,
+        )
+        self.assertIn("project.field.set:Status", operations)
+        progress_call = next(
+            arguments
+            for operation, arguments in fake.mutation_calls
+            if operation == "project.field.set:Gate progress"
+        )
+        self.assertIn("--number", progress_call)
+
+    def test_bootstrap_accepts_real_gh_generic_field_shape(self) -> None:
+        fake = ProjectFake(apply=False, real_field_shape=True)
+        self.assertEqual(
+            governance.bootstrap_project("LicoLand", gh=fake),
+            [],
+        )
+
+    def test_project_item_read_fails_closed_when_gh_truncates_results(self) -> None:
+        with self.assertRaises(governance.GovernanceError) as context:
+            governance._project_items({"items": [], "totalCount": 501})
+        self.assertEqual(context.exception.code, "github-project-limit")
 
 
 class FinalizeTests(unittest.TestCase):
