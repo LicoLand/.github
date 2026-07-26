@@ -28,7 +28,6 @@ from typing import Any, Iterable, Mapping, MutableMapping, Sequence
 DEFAULT_PLAN_PATH = "docs/releases/plan.json"
 DOCUMENT_PATH = "docs/releases/README.md"
 DEFAULT_PROJECT_TITLE = "LicoLand Release Portfolio"
-RELEASE_ENVIRONMENT = "release-portfolio"
 PROFILES = {
     "governance",
     "continuous-site",
@@ -1358,8 +1357,6 @@ def _github_verify(
     plan: Mapping[str, Any],
     gh: GhClient,
     *,
-    project_owner: str,
-    project_title: str,
     tag: str | None,
 ) -> None:
     repository = plan.get("repository")
@@ -1483,59 +1480,12 @@ def _github_verify(
                 "plan",
             )
 
-    try:
-        project = _find_project(gh, project_owner, project_title)
-    except GovernanceError as exc:
-        report.error(exc.code, exc.message, "plan")
-        return
-    if project is None:
-        report.error("github-project", "release portfolio was not found", "plan")
-        return
-    if project.get("public") is not False:
-        report.error(
-            "github-project-privacy",
-            "release portfolio must be explicitly reported as private",
-            "plan",
-        )
-        return
-    number = project.get("number")
-    if not isinstance(number, int):
-        report.error("github-project", "release portfolio has no usable number", "plan")
-        return
-    try:
-        item_data = gh.json(
-            [
-                "project",
-                "item-list",
-                str(number),
-                "--owner",
-                project_owner,
-                "--limit",
-                "1000",
-                "--format",
-                "json",
-            ]
-        )
-    except GovernanceError as exc:
-        report.error(exc.code, exc.message, "plan")
-        return
-    project_urls = _project_item_urls(item_data)
-    missing_count = len(set(issue_expectations).difference(project_urls))
-    if missing_count:
-        report.error(
-            "github-project-items",
-            f"release portfolio is missing {missing_count} required issue item(s)",
-            "plan",
-        )
-
 
 def verify_repository(
     repository_root: Path | str,
     plan_path: str | Path = DEFAULT_PLAN_PATH,
     *,
     github: bool = False,
-    project_owner: str = "LicoLand",
-    project_title: str = DEFAULT_PROJECT_TITLE,
     tag: str | None = None,
     gh: GhClient | None = None,
     expected_repository: str | None = None,
@@ -1567,8 +1517,6 @@ def verify_repository(
             report,
             plan,
             gh or GhClient(apply=False),
-            project_owner=project_owner,
-            project_title=project_title,
             tag=tag,
         )
     return report
@@ -1805,155 +1753,6 @@ def bootstrap_project(
                     "github-project-field",
                     f"project field '{name}' is missing required options",
                 )
-    return client.operations
-
-
-def _validate_branch_name(branch: Any) -> None:
-    if (
-        not isinstance(branch, str)
-        or not branch
-        or len(branch) > 255
-        or branch == "@"
-        or branch.startswith("/")
-        or branch.endswith(("/", "."))
-        or "//" in branch
-        or ".." in branch
-        or "@{" in branch
-        or any(ord(character) < 32 or ord(character) == 127 for character in branch)
-        or any(character in branch for character in " ~^:?*[\\")
-        or any(
-            part.startswith(".") or part.endswith(".lock")
-            for part in branch.split("/")
-        )
-    ):
-        raise GovernanceError(
-            "branch-invalid",
-            "default branch is not a safe exact Git reference name",
-        )
-
-
-def _environment_list(data: Any) -> list[Mapping[str, Any]]:
-    environments = data.get("environments") if isinstance(data, Mapping) else None
-    if not isinstance(environments, list):
-        raise GovernanceError(
-            "github-response", "GitHub environment list has an invalid shape"
-        )
-    return [item for item in environments if isinstance(item, Mapping)]
-
-
-def _branch_policy_list(data: Any) -> list[Mapping[str, Any]]:
-    policies = data.get("branch_policies") if isinstance(data, Mapping) else data
-    if not isinstance(policies, list):
-        raise GovernanceError(
-            "github-response", "deployment branch-policy list has an invalid shape"
-        )
-    return [item for item in policies if isinstance(item, Mapping)]
-
-
-def _create_release_environment(client: GhClient, repository: str) -> None:
-    client.mutate_json(
-        "environment.create",
-        [
-            "api",
-            "--method",
-            "PUT",
-            f"repos/{repository}/environments/{RELEASE_ENVIRONMENT}",
-            "-F",
-            "deployment_branch_policy[protected_branches]=false",
-            "-F",
-            "deployment_branch_policy[custom_branch_policies]=true",
-        ],
-    )
-
-
-def _create_environment_branch_policy(
-    client: GhClient, repository: str, branch: str
-) -> None:
-    client.mutate_json(
-        "environment.branch-policy.create",
-        [
-            "api",
-            "--method",
-            "POST",
-            (
-                f"repos/{repository}/environments/{RELEASE_ENVIRONMENT}/"
-                "deployment-branch-policies"
-            ),
-            "-f",
-            f"name={branch}",
-            "-f",
-            "type=branch",
-        ],
-    )
-
-
-def bootstrap_environment(
-    repository: str,
-    branch: str,
-    *,
-    apply: bool = False,
-    gh: GhClient | None = None,
-) -> list[str]:
-    """Ensure a strict release environment without reading or writing secrets."""
-
-    if not isinstance(repository, str) or REPOSITORY_RE.fullmatch(repository) is None:
-        raise GovernanceError(
-            "repository", "repository must use a valid owner/name identity"
-        )
-    _validate_branch_name(branch)
-    _require_gh_apply_mode(gh, apply)
-    client = gh or GhClient(apply=apply)
-    environment_data = client.json(
-        ["api", f"repos/{repository}/environments?per_page=100"]
-    )
-    matches = [
-        environment
-        for environment in _environment_list(environment_data)
-        if environment.get("name") == RELEASE_ENVIRONMENT
-    ]
-    if len(matches) > 1:
-        raise GovernanceError(
-            "github-environment-duplicate",
-            "release environment identity is ambiguous",
-        )
-    if not matches:
-        _create_release_environment(client, repository)
-        _create_environment_branch_policy(client, repository, branch)
-        return client.operations
-
-    environment = matches[0]
-    deployment_policy = environment.get("deployment_branch_policy")
-    if (
-        not isinstance(deployment_policy, Mapping)
-        or deployment_policy.get("protected_branches") is not False
-        or deployment_policy.get("custom_branch_policies") is not True
-    ):
-        raise GovernanceError(
-            "github-environment-policy",
-            "release environment branch policy is unknown or not fail-closed",
-        )
-    branch_policy_data = client.json(
-        [
-            "api",
-            (
-                f"repos/{repository}/environments/{RELEASE_ENVIRONMENT}/"
-                "deployment-branch-policies?per_page=100"
-            ),
-        ]
-    )
-    policies = _branch_policy_list(branch_policy_data)
-    if not policies:
-        _create_environment_branch_policy(client, repository, branch)
-        return client.operations
-    if (
-        len(policies) != 1
-        or policies[0].get("name") != branch
-        or policies[0].get("type") != "branch"
-    ):
-        raise GovernanceError(
-            "github-environment-branch",
-            "release environment must allow only the exact default branch",
-        )
     return client.operations
 
 
@@ -3054,8 +2853,6 @@ def build_parser() -> argparse.ArgumentParser:
     verify = subparsers.add_parser("verify", help="verify the repository release plan")
     _common_plan_arguments(verify)
     verify.add_argument("--github", action="store_true")
-    verify.add_argument("--project-owner", default="LicoLand")
-    verify.add_argument("--project-title", default=DEFAULT_PROJECT_TITLE)
     verify.add_argument("--expected-repository")
     verify.add_argument("--tag")
     verify.add_argument("--json", action="store_true", dest="as_json")
@@ -3073,14 +2870,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     bootstrap.add_argument("--project-title", default=DEFAULT_PROJECT_TITLE)
     bootstrap.add_argument("--apply", action="store_true")
-
-    environment = subparsers.add_parser(
-        "bootstrap-environment",
-        help="ensure the repository release-portfolio environment",
-    )
-    environment.add_argument("--repository", required=True)
-    environment.add_argument("--branch", required=True)
-    environment.add_argument("--apply", action="store_true")
 
     sync = subparsers.add_parser(
         "sync-github", help="synchronize repository GitHub release objects"
@@ -3109,8 +2898,6 @@ def _command_verify(args: argparse.Namespace) -> int:
         args.repository_root,
         args.plan,
         github=args.github,
-        project_owner=args.project_owner,
-        project_title=args.project_title,
         tag=args.tag,
         expected_repository=args.expected_repository,
     )
@@ -3154,16 +2941,6 @@ def _command_bootstrap(args: argparse.Namespace) -> int:
     operations = bootstrap_project(
         args.project_owner,
         args.project_title,
-        apply=args.apply,
-    )
-    _print_operations(operations, applied=args.apply)
-    return 0
-
-
-def _command_bootstrap_environment(args: argparse.Namespace) -> int:
-    operations = bootstrap_environment(
-        args.repository,
-        args.branch,
         apply=args.apply,
     )
     _print_operations(operations, applied=args.apply)
@@ -3239,8 +3016,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _command_render(args)
         if args.command == "bootstrap-project":
             return _command_bootstrap(args)
-        if args.command == "bootstrap-environment":
-            return _command_bootstrap_environment(args)
         if args.command == "sync-github":
             return _command_sync(args)
         if args.command == "finalize":
