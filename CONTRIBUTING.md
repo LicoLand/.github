@@ -8,9 +8,6 @@ would need to adopt the change.
 
 | Topic | Repository |
 | --- | --- |
-| Agent governance platform, console, gateway, authorization, or storage | [Meshrix](https://github.com/LicoLand/Meshrix) |
-| Optional upstream service | [Meshrix-Services](https://github.com/LicoLand/Meshrix-Services) |
-| Optional provider, adapter, datastore, or agent plugin | [Meshrix-Plugins](https://github.com/LicoLand/Meshrix-Plugins) |
 | Desktop, mobile, native client, key custody, or endpoint encryption | [LicoUp](https://github.com/LicoLand/LicoUp) |
 | Federation protocol, governance strategy, compatibility, or certification rules | [Fabrigent](https://github.com/LicoLand/Fabrigent) |
 | Relay, mailbox, lease, acknowledgement, quota, or cleanup | [BadTower](https://github.com/LicoLand/BadTower) |
