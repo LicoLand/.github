@@ -3,48 +3,36 @@
 LicoLand develops open infrastructure for governed agents, private human–agent
 collaboration, and federated communication.
 
-The organization keeps governance, endpoint security, federation authority,
-and relay transport in separate repositories. Each project can be inspected,
-deployed, and extended without turning an intermediary service into a hidden
-source of trust.
+Three public projects form one stack: a secure endpoint client, a neutral
+federation protocol, and an untrusted communication station. Each can be
+inspected, deployed, and extended on its own, without turning an intermediary
+service into a hidden source of trust.
 
 ## Projects
 
-| Project | Responsibility | License |
-| --- | --- | --- |
-| [LicoUp](https://github.com/LicoLand/LicoUp) | Offline-capable human–agent client with endpoint-owned security and optional federation. | GPL-3.0-or-later |
-| [Fabrigent](https://github.com/LicoLand/Fabrigent) | Normative federation protocol, strategy, governance, and conformance authority. | GPL-3.0-or-later |
-| [BadTower](https://github.com/LicoLand/BadTower) | Untrusted relay node for opaque delivery, mailbox, lease, acknowledgement, quota, and cleanup. | AGPL-3.0-or-later |
-| [LicoArc-Plugins](https://github.com/LicoLand/LicoArc-Plugins) | Long-lived LicoArc ecosystem integrations that do not own the LicoUp client or Fabrigent protocol. | Repository-specific |
-
-## Public sites and official services
-
-| Address | Role |
-| --- | --- |
-| [lico.land](https://lico.land/) | Organization introduction |
-| [licoland.com](https://licoland.com/) | Official service directory |
-| [licoup.com](https://licoup.com/) | LicoUp product site |
-| [licoup.net](https://licoup.net/) | Official LicoUp network |
-| [licoarc.com](https://licoarc.com/) | Official federation governance authority |
+- **[LicoUp](https://github.com/LicoLand/LicoUp)** — the endpoint client. An
+  open-source, local-first human–agent conversation client in which people and
+  visible agents collaborate under user-controlled identity, approval, and
+  disclosure.
+- **[LicoArc](https://github.com/LicoLand/LicoArc)** — the federation
+  protocol. The implementation-neutral Protocol Layer for secure endpoint
+  exchange, station-facing delivery, and federation governance.
+- **[BadTower](https://github.com/LicoLand/BadTower)** — the communication
+  station. A pure, protocol-neutral station that remains an untrusted
+  transport by design.
 
 ## Trust boundaries
 
-- LicoUp keeps identity, approval, key custody, encryption, and decryption on
+- Identity, approval, key custody, encryption, and decryption stay on
   user-controlled endpoints.
-- BadTower is designed as an untrusted transport and never becomes a source of
-  plaintext, client keys, or local approval authority.
-- Fabrigent owns neutral federation rules and conformance material. LicoUp and
-  BadTower consume versioned protocol artifacts instead of importing sibling
-  source.
+- A station never becomes a source of plaintext, client keys, or local
+  approval authority.
+- LicoUp and BadTower consume versioned Lico Arc protocol artifacts instead of
+  importing sibling source.
 - Official hosted services are deployments of public project contracts, not
   alternate product authorities.
 
-## Organization governance
-
-[Lico-Auditor](https://github.com/LicoLand/Lico-Auditor) maintains independent
-public audit policies and evidence contracts. Lico-Dev is the private
-governance source for repository routing, agent skills, and reusable
-verification workflows.
+## Contribute
 
 Use the owning repository for bugs and feature proposals. See the organization
 [contribution guide](https://github.com/LicoLand/.github/blob/main/CONTRIBUTING.md)

@@ -9,7 +9,7 @@ would need to adopt the change.
 | Topic | Repository |
 | --- | --- |
 | Desktop, mobile, native client, key custody, or endpoint encryption | [LicoUp](https://github.com/LicoLand/LicoUp) |
-| Federation protocol, governance strategy, compatibility, or certification rules | [Fabrigent](https://github.com/LicoLand/Fabrigent) |
+| Federation protocol, governance strategy, compatibility, or certification rules | [LicoArc](https://github.com/LicoLand/LicoArc) |
 | Relay, mailbox, lease, acknowledgement, quota, or cleanup | [BadTower](https://github.com/LicoLand/BadTower) |
 | Independent audit policy or evidence contract | [Lico-Auditor](https://github.com/LicoLand/Lico-Auditor) |
 
