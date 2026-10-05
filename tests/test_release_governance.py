@@ -876,14 +876,15 @@ class WorkflowAndSchemaTests(unittest.TestCase):
         self.assertIn("--github", text)
         self.assertNotIn("secrets:", text)
 
-    def test_native_starter_combines_governance_and_independent_audit(self) -> None:
+    def test_native_starter_combines_governance_and_general_audit(self) -> None:
         text = (
             ROOT
             / "workflow-templates"
             / "licoland-repository-release-governance.yml"
         ).read_text(encoding="utf-8")
         self.assertIn("pull_request:", text)
-        self.assertIn("LicoLand/Lico-Auditor", text)
+        self.assertIn("Unka-Malloc/General-Auditor@only", text)
+        self.assertIn("scope: history", text)
         self.assertIn("pull-requests: read", text)
 
     def test_cli_exposes_current_commands(self) -> None:
