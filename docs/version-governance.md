@@ -221,3 +221,10 @@ the plan so the release enters immutable history.
 
 Development, verification, packaging, GitHub Release, signing, and every
 external store or distribution channel remain separate claims.
+
+## Private audit evidence
+
+General-Auditor CI performs checks without creating or uploading audit reports.
+Run contextual audit reports locally; exact source evidence remains under the
+Git-ignored `.general-auditor/local/` directory. Do not attach those reports or
+source matches to pull requests, issues, build artifacts or remote logs.

@@ -22,7 +22,7 @@ acceptance checks pass. Issues are optional references, not release authority.
 
 - Sanitized task receipts:
 - Repository-owned checks:
-- General-Auditor report reviewed locally:
+- General-Auditor contextual review completed locally (do not attach raw reports or source matches):
 
 ## Review checklist
 
