@@ -22,7 +22,7 @@ acceptance checks pass. Issues are optional references, not release authority.
 
 - Sanitized task receipts:
 - Repository-owned checks:
-- Independent Lico-Auditor status:
+- General-Auditor contextual review completed locally (do not attach raw reports or source matches):
 
 ## Review checklist
 
@@ -32,5 +32,5 @@ acceptance checks pass. Issues are optional references, not release authority.
 - [ ] Generated release documentation is current.
 - [ ] Acceptance evidence is synthetic or redacted.
 - [ ] After merge, a plan-only pull request will record `accepted` status and reviewed evidence.
-- [ ] Lico-Auditor remains independent; this change does not configure, weaken, or bypass it.
+- [ ] General-Auditor advisory signals received contextual review from a local Agent; no signal was treated as an automatic content block.
 - [ ] Packaging, GitHub Release, and external distribution claims remain separate.

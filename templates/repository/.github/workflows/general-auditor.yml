@@ -1,4 +1,4 @@
-name: repository-release-governance
+name: General-Auditor
 
 on:
   pull_request:
@@ -9,7 +9,7 @@ on:
       - ready_for_review
   push:
     branches:
-      - $default-branch
+      - "@DEFAULT_BRANCH@"
     tags:
       - "v*.*.*"
       - "*-v*.*.*"
@@ -17,22 +17,10 @@ on:
 
 permissions:
   contents: read
-  pull-requests: read
 
 jobs:
-  version-governance:
-    uses: LicoLand/.github/.github/workflows/reusable-version-governance.yml@f9d2a1419e494610fd320504fbcad9b04e9eb614
-    with:
-      governance_ref: "f9d2a1419e494610fd320504fbcad9b04e9eb614"
-      target_repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
-      target_ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      expected_repository: ${{ github.repository }}
-      plan_path: docs/releases/plan.json
-      tag: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
-      require_tag: ${{ github.ref_type == 'tag' }}
-
-  general-auditor:
-    name: General-Auditor
+  auditor:
+    name: Auditor
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

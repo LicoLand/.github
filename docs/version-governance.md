@@ -117,7 +117,7 @@ means:
 - every transitive dependency exists and is accepted;
 - the version source and changelog name the target version;
 - repository-owned build, security, packaging, and acceptance checks pass; and
-- the independent Lico-Auditor final gate passes.
+- General-Auditor completes and its advisory signals receive contextual review from a local Agent; CI findings alone do not block a release.
 
 Project availability, Project fields, Project views, projection lag, Issues,
 and Milestones cannot approve or block a release.
@@ -133,7 +133,7 @@ Use this implementation sequence:
 3. In that Draft pull request, set the feature to `active` and record its PR
    URL. Continue implementation and targeted verification on the same PR.
 4. When acceptance checks pass, mark the PR ready for review.
-5. Pass repository gates and Lico-Auditor, then merge to the declared branch.
+5. Pass repository gates and review General-Auditor advisory signals locally, then merge to the declared branch.
 6. Merge a plan-only acceptance PR that records evidence and changes the
    feature to `accepted`.
 
@@ -197,8 +197,7 @@ Each repository carries:
   immutable organization verifier revision and digest;
 - `.github/workflows/version-governance.yml`, the read-only plan, PR, and tag
   gate pinned to the same revision; and
-- `.github/workflows/lico-auditor-release-gate.yml`, the independent audit
-  caller.
+- `.github/workflows/general-auditor.yml`, the read-only General-Auditor caller.
 
 The reusable gate needs only `contents: read` and `pull-requests: read`.
 It uses the repository-provided GitHub token. Cross-repository dependencies in
@@ -214,11 +213,18 @@ tools/release/verify-version-governance verify
 
 ## Publication boundary
 
-After a ready release passes repository acceptance and Lico-Auditor, create its
-matching tag. Treat the tag as a candidate until the tag governance and
-full-history audit checks pass. Publish a GitHub Release only after applicable
-tag checks succeed, then finalize the plan so the release enters immutable
-history.
+After a ready release passes repository acceptance and local Agent review of
+General-Auditor advisory signals, create its matching tag. Treat the tag as a
+candidate until tag governance and the General-Auditor full-history scan finish.
+Publish a GitHub Release only after applicable tag checks succeed, then finalize
+the plan so the release enters immutable history.
 
 Development, verification, packaging, GitHub Release, signing, and every
 external store or distribution channel remain separate claims.
+
+## Private audit evidence
+
+General-Auditor CI performs checks without creating or uploading audit reports.
+Run contextual audit reports locally; exact source evidence remains under the
+Git-ignored `.general-auditor/local/` directory. Do not attach those reports or
+source matches to pull requests, issues, build artifacts or remote logs.

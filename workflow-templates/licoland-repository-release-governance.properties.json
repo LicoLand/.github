@@ -1,6 +1,6 @@
 {
   "name": "LicoLand Repository Release Governance",
-  "description": "Validate plan-driven features and Draft PR evidence, then run the independent Lico-Auditor gate.",
+  "description": "Validate plan-driven features and Draft PR evidence, run General-Auditor checks without generating or uploading audit reports.",
   "categories": [
     "Automation"
   ]
